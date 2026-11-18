@@ -361,6 +361,10 @@ const ROLES_REPORTES = ['Monitorista', 'Supervisor', 'Mantenimiento', 'Operacion
 function api_reportes(token, desdeIso, hastaIso, estacionId, texto) {
   return out_(ReporteService.listar(ctx_(token, ROLES_REPORTES), desdeIso, hastaIso, estacionId, texto));
 }
+/** Datos del reporte descargable (Excel) del periodo: columnas + filas. El navegador arma el .xlsx. */
+function api_reporteExportar(token, desdeIso, hastaIso, estacionId) {
+  return out_(ReporteService.exportar(ctx_(token, ROLES_REPORTES), desdeIso, hastaIso, estacionId));
+}
 /** Devuelve el PDF del reporte en base64 para descargarlo en el navegador. */
 function api_reportePdf(token, ticketId) {
   return out_(ReporteService.pdfParaDescarga(ticketId, ctx_(token, ROLES_REPORTES)));

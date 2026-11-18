@@ -114,6 +114,8 @@ function job_cicloMonitoreo() {
       console.error(e);
     }
   }
+  // Dirección según las coordenadas de los tickets (Samsara -> Google -> OpenStreetMap)
+  try { const nd = ReporteService.completarDirecciones(); if (nd) console.log('Direcciones completadas: ' + nd); } catch (e) { console.error(e); }
   const escalados = TicketService.revisarSla();
   if (escalados) console.log('Tickets escalados por SLA: ' + escalados);
   const turnos = TurnoService.cerrarVencidos();

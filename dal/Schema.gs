@@ -57,7 +57,9 @@ const SCHEMA = {
             // Modelo de catálogos (paso 3): tipo + circuito -> lista(s) de distribución
             'tipo_id', 'clasificacion', 'severidad', 'circuito_id', 'listas', 'respaldo',
             // Seguridad Vial: reportes de conducta de riesgo (sin SLA)
-            'bandeja', 'url_video'],
+            'bandeja', 'url_video',
+            // Dirección según las coordenadas: fuente samsara | google | osm | sin_direccion (se rindió tras varios intentos)
+            'direccion', 'direccion_fuente', 'direccion_en', 'direccion_intentos'],
   evidencias: ['id', 'alarma_id', 'ticket_id', 'tipo', 'nombre', 'mime', 'archivo_id', 'subido_por', 'creado_en'],
   seguimientos: ['id', 'alarma_id', 'ticket_id', 'usuario', 'accion', 'nota', 'creado_en'],
 

@@ -804,10 +804,10 @@
       const rows = await api('api_reportes', desde.toISOString(), hasta.toISOString(), $('r-estacion').value, $('r-texto').value);
       const est = { abierto: ['Abierto', 'amarillo'], en_seguimiento: ['En seguimiento', 'amarillo'], escalado: ['Escalado', 'morado'], cerrado: ['Cerrado', 'verde'] };
       $('tbl-reportes').innerHTML = !rows.length ? '<div class="empty">Sin reportes en el periodo</div>' :
-        '<table><thead><tr><th>Folio</th><th>Fecha</th><th>Unidad</th><th>Conductor</th><th>Incidencia</th><th>Cliente</th><th>Monitorista</th><th>Estación</th><th>Evid.</th><th>Estatus</th><th></th></tr></thead><tbody>' +
+        '<table><thead><tr><th>Folio</th><th>Fecha</th><th>Unidad</th><th>Conductor</th><th>Incidencia</th><th>Lugar / dirección</th><th>Cliente</th><th>Monitorista</th><th>Estación</th><th>Evid.</th><th>Estatus</th><th></th></tr></thead><tbody>' +
         rows.map((t) => { const s = est[t.estatus] || [t.estatus, 'gris'];
           return `<tr><td><b>${esc(t.folio)}</b></td><td>${fecha(t.creado_en)}</td><td>${esc(t.unidad_id)}</td><td>${esc(t.operador || '-')}</td>
-            <td>${esDeSV(t) ? pill('SEGURIDAD VIAL', 'morado') + ' ' : ''}${esc(t.tipo_evento || t.categoria)}</td><td>${esc(t.cliente || '-')}</td><td>${esc(t.monitorista)}</td><td>${esDeSV(t) ? '—' : esc(nombreEstacion(t.estacion_id))}</td>
+            <td>${esDeSV(t) ? pill('SEGURIDAD VIAL', 'morado') + ' ' : ''}${esc(t.tipo_evento || t.categoria)}</td><td class="wrap small">${esc(t.lugar || '-')}${t.direccion ? '<br><span class="muted">' + esc(t.direccion) + '</span>' : ''}</td><td>${esc(t.cliente || '-')}</td><td>${esc(t.monitorista)}</td><td>${esDeSV(t) ? '—' : esc(nombreEstacion(t.estacion_id))}</td>
             <td>${t.evidencias}</td><td>${pill(s[0], s[1])}</td>
             <td><button class="btn" onclick="descargarPdf('${esc(t.id)}', this)">PDF</button></td></tr>`; }).join('') + '</tbody></table>';
     },
@@ -827,6 +827,136 @@
         rows.map((c) => `<tr><td>${esc(c.operador)}</td><td>${esc(c.modulos_completados_pct ?? '-')}%</td><td>${esc(c.safety_score ?? '-')}</td><td>${esc(c.estatus_revision)}</td></tr>`).join('') + '</tbody></table>';
     },
   };
+  // ================= Excel (.xlsx) sin librerías =================
+  // Un .xlsx es un ZIP con archivos XML. Se arma aquí (ZIP sin compresión) para no depender de librerías externas;
+  // funciona igual en Apps Script y en la versión Docker. Columnas: [{ titulo, tipo: texto|numero|fecha|enlace, ancho }].
+  const Excel = (function () {
+    const http = (p) => 'http:' + '/' + '/' + p;
+    const NS_MAIN = http('schemas.openxmlformats.org/spreadsheetml/2006/main');
+    const NS_REL = http('schemas.openxmlformats.org/officeDocument/2006/relationships');
+    const NS_PKG = http('schemas.openxmlformats.org/package/2006/relationships');
+    const NS_CT = http('schemas.openxmlformats.org/package/2006/content-types');
+    const CT = 'application/vnd.openxmlformats-officedocument.spreadsheetml.';
+    const XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+    const MAPA_XML = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+    function escXml(v) {
+      const s = String(v === null || v === undefined ? '' : v);
+      let out = '';
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i], c = s.charCodeAt(i);
+        if (c < 32 && c !== 9 && c !== 10 && c !== 13) continue;   // caracteres de control no válidos en XML
+        out += MAPA_XML[ch] || ch;
+      }
+      return out;
+    }
+    function columna(i) { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
+    /** 'dd/MM/yyyy' -> número de serie de Excel (o null). */
+    function serieFecha(txt) {
+      const p = String(txt || '').split('/');
+      if (p.length !== 3) return null;
+      const d = Number(p[0]), m = Number(p[1]), a = Number(p[2]);
+      if (!d || !m || !a) return null;
+      return Date.UTC(a, m - 1, d) / 864e5 + 25569;
+    }
+    function hoja(columnas, filas) {
+      const ultima = columna(columnas.length - 1);
+      const cel = (ref, estilo, v) => `<c r="${ref}" t="inlineStr"${estilo ? ' s="' + estilo + '"' : ''}><is><t xml:space="preserve">${escXml(v)}</t></is></c>`;
+      let xml = XML + `<worksheet xmlns="${NS_MAIN}" xmlns:r="${NS_REL}"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` +
+        '<sheetFormatPr defaultRowHeight="15"/><cols>' + columnas.map((c, i) => `<col min="${i + 1}" max="${i + 1}" width="${Number(c.ancho) || 14}" customWidth="1"/>`).join('') + '</cols><sheetData>';
+      xml += '<row r="1">' + columnas.map((c, i) => cel(columna(i) + '1', 1, c.titulo)).join('') + '</row>';
+      filas.forEach((f, r) => {
+        const n = r + 2;
+        xml += `<row r="${n}">` + columnas.map((c, i) => {
+          const ref = columna(i) + n, v = f[i];
+          if (v === '' || v === null || v === undefined) return '';
+          if (c.tipo === 'numero' && !isNaN(Number(v))) return `<c r="${ref}"><v>${Number(v)}</v></c>`;
+          if (c.tipo === 'fecha') { const sf = serieFecha(v); if (sf !== null) return `<c r="${ref}" s="2"><v>${sf}</v></c>`; }
+          if (c.tipo === 'enlace') {
+            const url = String(v).split('"').join('');
+            return `<c r="${ref}" t="str" s="3"><f>${escXml('HYPERLINK("' + url + '","Ver mapa")')}</f><v>Ver mapa</v></c>`;
+          }
+          return cel(ref, 0, v);
+        }).join('') + '</row>';
+      });
+      return xml + `</sheetData><autoFilter ref="A1:${ultima}${filas.length + 1}"/></worksheet>`;
+    }
+    const ESTILOS = XML + `<styleSheet xmlns="${NS_MAIN}"><numFmts count="1"><numFmt numFmtId="164" formatCode="dd/mm/yyyy"/></numFmts>` +
+      '<fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font><font><u/><sz val="11"/><color rgb="FF0563C1"/><name val="Calibri"/></font></fonts>' +
+      '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E79"/><bgColor indexed="64"/></patternFill></fill></fills>' +
+      '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+      '<cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>' +
+      '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>' +
+      '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
+
+    // ---- ZIP (método "store", sin compresión) ----
+    const CRC = (function () { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+    function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+    function zip(archivos) {
+      const enc = new TextEncoder();
+      const ahora = new Date();
+      const hora = (ahora.getHours() << 11) | (ahora.getMinutes() << 5) | Math.floor(ahora.getSeconds() / 2);
+      const dia = ((ahora.getFullYear() - 1980) << 9) | ((ahora.getMonth() + 1) << 5) | ahora.getDate();
+      const partes = [], central = [];
+      let pos = 0;
+      archivos.forEach((a) => {
+        const nombre = enc.encode(a.nombre), datos = enc.encode(a.contenido), crc = crc32(datos);
+        const loc = new DataView(new ArrayBuffer(30));
+        [[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, hora, 2], [12, dia, 2], [14, crc, 4], [18, datos.length, 4], [22, datos.length, 4], [26, nombre.length, 2], [28, 0, 2]]
+          .forEach((x) => (x[2] === 4 ? loc.setUint32(x[0], x[1], true) : loc.setUint16(x[0], x[1], true)));
+        partes.push(new Uint8Array(loc.buffer), nombre, datos);
+        const cen = new DataView(new ArrayBuffer(46));
+        [[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, hora, 2], [14, dia, 2], [16, crc, 4], [20, datos.length, 4], [24, datos.length, 4],
+          [28, nombre.length, 2], [30, 0, 2], [32, 0, 2], [34, 0, 2], [36, 0, 2], [38, 0, 4], [42, pos, 4]]
+          .forEach((x) => (x[2] === 4 ? cen.setUint32(x[0], x[1], true) : cen.setUint16(x[0], x[1], true)));
+        central.push(new Uint8Array(cen.buffer), nombre);
+        pos += 30 + nombre.length + datos.length;
+      });
+      const tamCentral = central.reduce((s, b) => s + b.length, 0);
+      const fin = new DataView(new ArrayBuffer(22));
+      [[0, 0x06054b50, 4], [4, 0, 2], [6, 0, 2], [8, archivos.length, 2], [10, archivos.length, 2], [12, tamCentral, 4], [16, pos, 4], [20, 0, 2]]
+        .forEach((x) => (x[2] === 4 ? fin.setUint32(x[0], x[1], true) : fin.setUint16(x[0], x[1], true)));
+      return new Blob(partes.concat(central, [new Uint8Array(fin.buffer)]), { type: CT + 'sheet' });
+    }
+
+    /** Devuelve un Blob .xlsx con una hoja. */
+    function libro(nombreHoja, columnas, filas) {
+      const hojaNombre = escXml(String(nombreHoja || 'Reporte').slice(0, 31));
+      return zip([
+        { nombre: '[Content_Types].xml', contenido: XML + `<Types xmlns="${NS_CT}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>` +
+          `<Override PartName="/xl/workbook.xml" ContentType="${CT}sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="${CT}worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="${CT}styles+xml"/></Types>` },
+        { nombre: '_rels/.rels', contenido: XML + `<Relationships xmlns="${NS_PKG}"><Relationship Id="rId1" Type="${NS_REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>` },
+        { nombre: 'xl/workbook.xml', contenido: XML + `<workbook xmlns="${NS_MAIN}" xmlns:r="${NS_REL}"><sheets><sheet name="${hojaNombre}" sheetId="1" r:id="rId1"/></sheets></workbook>` },
+        { nombre: 'xl/_rels/workbook.xml.rels', contenido: XML + `<Relationships xmlns="${NS_PKG}"><Relationship Id="rId1" Type="${NS_REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${NS_REL}/styles" Target="styles.xml"/></Relationships>` },
+        { nombre: 'xl/styles.xml', contenido: ESTILOS },
+        { nombre: 'xl/worksheets/sheet1.xml', contenido: hoja(columnas, filas) },
+      ]);
+    }
+    return { libro: libro };
+  })();
+
+  /** Reportes → Descargar Excel: elige el periodo (y la estación, en supervisión) y descarga el .xlsx. */
+  function formDescargaExcel() {
+    const hoy = new Date().toLocaleDateString('en-CA');
+    abrirModal('Descargar reporte en Excel', `
+      <div class="grid2"><label>Desde<input type="date" name="desde" value="${hoy}" required></label><label>Hasta<input type="date" name="hasta" value="${hoy}" required></label></div>
+      ${esSup() ? `<label>Estación<select name="estacion"><option value="">Todas</option>${opciones(S.estaciones.map((e) => ({ v: e.id, t: e.nombre })), '')}</select></label>` : ''}
+      <div class="muted small">Tickets de Monitoreo creados en el periodo (máximo 93 días por descarga), con las columnas del reporte diario más la dirección según las coordenadas y un enlace al mapa. Seguridad Vial no se incluye.</div>
+      <div id="xl-res"></div>`,
+      async (f) => {
+        const desde = new Date(f.get('desde') + 'T00:00:00'), hasta = new Date(f.get('hasta') + 'T23:59:59');
+        if (isNaN(desde) || isNaN(hasta) || hasta < desde) throw new Error('Elige un periodo válido.');
+        $('xl-res').innerHTML = '<div class="muted">Preparando el reporte…</div>';
+        const r = await api('api_reporteExportar', desde.toISOString(), hasta.toISOString(), f.get('estacion') || '');
+        if (!r.total) { $('xl-res').innerHTML = '<div class="info">No hay tickets en ese periodo.</div>'; return 'mantener'; }
+        const url = URL.createObjectURL(Excel.libro('Reporte', r.columnas, r.filas));
+        const nombre = 'reporte_incidencias_' + f.get('desde') + (f.get('hasta') !== f.get('desde') ? '_a_' + f.get('hasta') : '') + '.xlsx';
+        const pend = r.filas.filter((x) => x[r.columnas.findIndex((c) => c.clave === 'direccion')] === 'Pendiente').length;
+        $('xl-res').innerHTML = `<div class="info">${r.total} ticket(s).${pend ? ' ' + pend + ' aún sin dirección (se completan solas en unos minutos).' : ''}</div>
+          <a class="btn grande" style="display:block;text-align:center;text-decoration:none;margin-top:8px" href="${url}" download="${esc(nombre)}">⬇ Descargar ${esc(nombre)}</a>`;
+        return 'mantener';
+      }, 'Preparar');
+  }
+
   function forzarEntrega(turnoId, nombre) {
     pedirTexto('Cerrar turno de ' + nombre, 'Motivo (sus alarmas en atención regresarán a la cola)', (t) => api('api_forzarEntrega', turnoId, t), 'Cerrar turno');
   }

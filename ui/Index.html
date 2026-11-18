@@ -105,6 +105,8 @@
           <label id="r-estacion-wrap" hidden>Estación <select id="r-estacion"></select></label>
           <input id="r-texto" placeholder="Folio, unidad, conductor, cliente…">
           <button class="btn" onclick="cargar.reportes()">Buscar</button>
+          <span class="spacer"></span>
+          <button class="btn sec" onclick="formDescargaExcel()">⬇ Descargar Excel</button>
         </div>
         <div id="tbl-reportes" class="tbl" style="margin-top:12px"></div>
         <p class="muted small">El PDF sigue el formato de la "Plantilla de Reporte": datos de la unidad y del conductor, incidencia, captura de Samsara y evidencias fotográficas.</p>
