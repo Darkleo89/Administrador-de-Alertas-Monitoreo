@@ -1,0 +1,1427 @@
+<script>
+  // ================= Infraestructura =================
+  const $ = (id) => document.getElementById(id);
+  // OJO: Apps Script preprocesa este JS y confunde ciertos regex literales (p. ej. con "//" o comillas)
+  // con comentarios/cadenas, rompiendo la página. En este archivo se evitan esos regex.
+  const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const esc = (v) => Array.from(String(v ?? '')).map((ch) => ESC_MAP[ch] || ch).join('');
+  const esHttps = (u) => String(u || '').indexOf('https:' + '/' + '/') === 0;
+  const MAPS_URL = 'https:' + '/' + '/maps.google.com/?q=';
+  const fecha = (v) => (v ? new Date(v).toLocaleString('es-MX', { dateStyle: 'short', timeStyle: 'short' }) : '-');
+  const hora = (v) => (v ? new Date(v).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }) : '-');
+  const pill = (txt, cls) => `<span class="pill ${cls}">${esc(txt)}</span>`;
+  const store = {
+    get(k) { try { return sessionStorage.getItem(k); } catch (e) { return store._m[k] || null; } },
+    set(k, v) { try { sessionStorage.setItem(k, v); } catch (e) { store._m[k] = v; } },
+    del(k) { try { sessionStorage.removeItem(k); } catch (e) { delete store._m[k]; } },
+    _m: {},
+  };
+  function toast(msg) {
+    const t = $('toast'); t.textContent = msg; t.hidden = false;
+    clearTimeout(t._h); t._h = setTimeout(() => (t.hidden = true), 6000);
+  }
+  const errMsg = (e) => (e && e.message ? e.message : String(e)).replace(/^(Exception|Error): /, '').replace(/^(SESION|PASSWORD|TURNO): /, '');
+
+  // Sesión: el token vive en sessionStorage (se borra al cerrar la pestaña).
+  let TOKEN = store.get('token');
+  let S = null;   // datos de sesión (usuario, turno, estaciones)
+  let C = null;   // datos de la consola
+
+  let pendientes = 0;
+  /** Llama al backend. Agrega el token y maneja expiración de sesión / turno / contraseña. */
+  function api(fn, ...args) {
+    pendientes++; $('cargando').hidden = false;
+    const conToken = fn === 'api_login' ? args : [TOKEN, ...args];
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler((r) => { if (--pendientes === 0) $('cargando').hidden = true; resolve(r); })
+        .withFailureHandler((e) => {
+          if (--pendientes === 0) $('cargando').hidden = true;
+          const m = e && e.message ? e.message : '';
+          if (m.indexOf('SESION:') !== -1) { TOKEN = null; store.del('token'); mostrar('login'); $('login-error').textContent = errMsg(e); }
+          else if (m.indexOf('PASSWORD:') !== -1) mostrarPassword(false);
+          else if (m.indexOf('TURNO:') !== -1) arrancar();
+          reject(e);
+        })[fn](...conToken);
+    });
+  }
+
+  const esSup = () => S && (S.usuario.rol === 'Supervisor' || S.usuario.rol === 'Admin');
+  const esAdmin = () => S && S.usuario.rol === 'Admin';
+  const esDeSV = (x) => !!x && x.bandeja === 'seguridad_vial';
+  const NOMBRE_BANDEJA = { monitoreo: 'Monitoreo', seguridad_vial: 'Seguridad Vial' };
+  const nombreEstacion = (id) => { const e = ((C && C.estaciones) || (S && S.estaciones) || []).find((x) => x.id === id); return e ? e.nombre : 'Sin estación'; };
+
+  /** Pestañas visibles por rol. */
+  const TABS_POR_ROL = {
+    Monitorista: ['consola', 'reportes', 'desempeno', 'eta'],
+    'Seguridad Vial': ['consola', 'reportes', 'desempeno'],
+    Supervisor: ['consola', 'reportes', 'desempeno', 'turnos', 'eta', 'inactivas', 'capacitacion', 'config'],
+    Admin: ['consola', 'reportes', 'desempeno', 'turnos', 'eta', 'inactivas', 'capacitacion', 'config'],
+    Mantenimiento: ['reportes', 'inactivas'], Operaciones: ['reportes', 'eta', 'inactivas'], 'Jurídico': ['reportes', 'inactivas'], 'Capital Humano': ['reportes', 'capacitacion'],
+  };
+
+  // ================= Pantallas =================
+  function mostrar(cual) {
+    ['login', 'password', 'turno'].forEach((p) => ($('pantalla-' + p).hidden = p !== cual));
+    $('pantalla-app').hidden = cual !== 'app';
+  }
+  let passwordDesdeApp = false;
+  function mostrarPassword(cancelable) {
+    passwordDesdeApp = cancelable;
+    $('form-password').reset(); $('password-error').textContent = '';
+    $('btn-cancelar-pass').hidden = !cancelable;
+    mostrar('password');
+  }
+
+  $('form-login').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target); const btn = ev.target.querySelector('button'); btn.disabled = true;
+    $('login-error').textContent = '';
+    try {
+      const r = await api('api_login', f.get('usuario'), f.get('password'));
+      TOKEN = r.token; store.set('token', TOKEN); ev.target.reset();
+      arrancar();
+    } catch (e) { $('login-error').textContent = errMsg(e); }
+    btn.disabled = false;
+  });
+
+  $('form-password').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const f = new FormData(ev.target);
+    if (f.get('nueva') !== f.get('confirmar')) { $('password-error').textContent = 'Las contraseñas no coinciden.'; return; }
+    try { await api('api_cambiarPassword', f.get('actual'), f.get('nueva')); toast('Contraseña actualizada'); arrancar(); }
+    catch (e) { $('password-error').textContent = errMsg(e); }
+  });
+  $('btn-cancelar-pass').addEventListener('click', () => mostrar('app'));
+
+  $('form-turno').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try { await api('api_iniciarTurno', new FormData(ev.target).get('estacion')); arrancar(); }
+    catch (e) { $('turno-error').textContent = errMsg(e); }
+  });
+
+  async function salir() {
+    if (S && S.turno && !confirm('Tienes un turno activo. Si sales sin "Entregar turno", tus alarmas seguirán a tu nombre.\n\n¿Salir de todos modos?')) return;
+    try { await api('api_logout'); } catch (e) {}
+    TOKEN = null; store.del('token'); S = null; mostrar('login');
+  }
+
+  async function entregarTurno() {
+    let r = { alarmas: 0, tickets: 0 };
+    try { r = await api('api_resumenEntrega'); } catch (e) {}
+    abrirModal('Entregar turno', `
+      <div class="info">Tienes <b>${r.alarmas}</b> alarma(s) en atención (regresarán a la cola de tu estación) y
+        <b>${r.tickets}</b> ticket(s) abiertos (quedan visibles para el turno entrante).</div>
+      <label>Nota de relevo (pendientes, unidades a vigilar, acuerdos)<textarea name="nota" required></textarea></label>`,
+      async (f) => { await api('api_entregarTurno', f.get('nota')); TOKEN = null; store.del('token'); S = null; mostrar('login'); toast('Turno entregado. ¡Buen descanso!'); },
+      'Entregar y salir');
+  }
+
+  /** Carga la sesión y decide qué pantalla mostrar. */
+  async function arrancar() {
+    if (!TOKEN) { mostrar('login'); return; }
+    try { S = await api('api_sesion'); }
+    catch (e) {
+      // Nunca dejar la página en blanco: cualquier error al recuperar la sesión regresa al login con el mensaje.
+      const m = (e && e.message) || '';
+      if (m.indexOf('PASSWORD:') !== -1 || m.indexOf('TURNO:') !== -1) return; // ya se mostró su pantalla
+      TOKEN = null; store.del('token'); S = null;
+      mostrar('login');
+      if (m.indexOf('SESION:') === -1) $('login-error').textContent = 'No se pudo abrir la sesión: ' + errMsg(e);
+      return;
+    }
+    if (S.debe_cambiar_password) { mostrarPassword(false); return; }
+    if (S.requiere_turno && !S.turno) {
+      const p = S.programado;
+      $('turno-info').innerHTML = `Hola <b>${esc(S.usuario.nombre)}</b>. Turno actual: <b>${esc(p.nombre)}</b> (${hora(p.inicio)}–${hora(p.fin)}).`;
+      $('form-turno').estacion.innerHTML = S.estaciones.map((e) => `<option value="${esc(e.id)}" ${e.id === S.usuario.estacion_sugerida ? 'selected' : ''}>${esc(e.nombre)}</option>`).join('');
+      $('turno-error').textContent = S.estaciones.length ? '' : 'No hay estaciones dadas de alta. Avisa a supervisión.';
+      mostrar('turno'); return;
+    }
+    $('usuario').textContent = `${S.usuario.nombre} · ${S.usuario.rol}`;
+    $('hdr-turno').textContent = S.turno ? `Turno ${S.turno.turno} desde ${hora(S.turno.inicio_en)} · ${nombreEstacion(S.turno.estacion_id)}` : '';
+    $('btn-entregar').hidden = !S.turno;
+    const tabs = TABS_POR_ROL[S.usuario.rol] || [];
+    document.querySelectorAll('nav button').forEach((b) => (b.hidden = tabs.indexOf(b.dataset.tab) === -1));
+    mostrar('app');
+    abrir(tabs.indexOf(tabActual) !== -1 ? tabActual : tabs[0]);
+  }
+
+  // ================= Temporizadores en vivo =================
+  function fmtDur(ms) {
+    const neg = ms < 0; ms = Math.abs(ms);
+    const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000), s = Math.floor((ms % 60000) / 1000);
+    return (neg ? '-' : '') + (h ? h + 'h ' : '') + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  }
+  function tick() {
+    const now = Date.now();
+    document.querySelectorAll('.timer[data-desde]').forEach((el) => {
+      const ms = now - new Date(el.dataset.desde).getTime();
+      el.textContent = fmtDur(ms);
+      el.classList.toggle('warn', ms > el.dataset.warn * 60000 && ms <= el.dataset.bad * 60000);
+      el.classList.toggle('bad', ms > el.dataset.bad * 60000);
+    });
+    document.querySelectorAll('.timer[data-hasta]').forEach((el) => {
+      const ms = new Date(el.dataset.hasta).getTime() - now;
+      el.textContent = ms >= 0 ? 'en ' + fmtDur(ms) : 'vencido ' + fmtDur(-ms);
+      el.classList.toggle('warn', ms >= 0 && ms < 10 * 60000);
+      el.classList.toggle('bad', ms < 0);
+    });
+  }
+  setInterval(tick, 1000);
+  const timerDesde = (iso) => `<span class="timer" data-desde="${esc(iso)}" data-warn="${((C && C.metaTicketMin) || 10) / 2}" data-bad="${(C && C.metaTicketMin) || 10}"></span>`;
+  const timerHasta = (iso) => `<span class="timer" data-hasta="${esc(iso)}"></span>`;
+
+  // ================= Modal =================
+  function abrirModal(titulo, html, onOk, textoOk, sinCancelar, ancho) {
+    document.querySelector('#modal .modal-box').classList.toggle('ancho', !!ancho);
+    $('modal-titulo').textContent = titulo;
+    $('modal-form').innerHTML = html;
+    const ok = $('modal-ok');
+    ok.textContent = textoOk || 'Guardar'; ok.disabled = false;
+    document.querySelector('.modal-ftr .sec').hidden = !!sinCancelar;
+    ok.onclick = async () => {
+      ok.disabled = true;
+      try { const sigue = await onOk(new FormData($('modal-form'))); if (sigue !== 'mantener') { cerrarModal(); refrescar(); } else ok.disabled = false; }
+      catch (e) { toast(errMsg(e)); ok.disabled = false; }
+    };
+    $('modal').hidden = false;
+    const first = $('modal-form').querySelector('input,select,textarea'); if (first) first.focus();
+  }
+  function cerrarModal() { $('modal').hidden = true; }
+  const opciones = (lista, sel) => lista.map((o) => { const v = typeof o === 'string' ? o : o.v; const t = typeof o === 'string' ? o : o.t;
+    return `<option value="${esc(v)}" ${v === sel ? 'selected' : ''}>${esc(t)}</option>`; }).join('');
+  function pedirTexto(titulo, etiqueta, onOk, textoOk) {
+    abrirModal(titulo, `<label>${esc(etiqueta)}<textarea name="t" required></textarea></label>`, (f) => onOk(f.get('t')), textoOk);
+  }
+  /** Muestra una contraseña temporal una sola vez. */
+  function mostrarClave(usuario, clave) {
+    abrirModal('Contraseña temporal', `<div class="info">Entrégala en persona a <b>${esc(usuario)}</b>. Solo se muestra esta vez; al entrar se le pedirá cambiarla.</div>
+      <div class="clave">${esc(clave)}</div>`, async () => {}, 'Listo', true);
+  }
+
+  // ================= Evidencias y PDF =================
+  /** Reduce una imagen en el navegador (JPEG) antes de subirla: { nombre, mime, base64 }. */
+  function reducirImagen(file, maxLado) {
+    return new Promise((resolve, reject) => {
+      if (!file.type || file.type.indexOf('image/') !== 0) { reject(new Error(file.name + ' no es una imagen.')); return; }
+      const fr = new FileReader();
+      fr.onerror = () => reject(new Error('No se pudo leer ' + file.name));
+      fr.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error('No se pudo abrir ' + file.name));
+        img.onload = () => {
+          const k = Math.min(1, maxLado / Math.max(img.width, img.height));
+          const cv = document.createElement('canvas');
+          cv.width = Math.round(img.width * k); cv.height = Math.round(img.height * k);
+          const cx = cv.getContext('2d');
+          cx.fillStyle = '#fff'; cx.fillRect(0, 0, cv.width, cv.height);
+          cx.drawImage(img, 0, 0, cv.width, cv.height);
+          const base = (file.name || 'imagen').split('.').slice(0, -1).join('.') || 'imagen';
+          resolve({ nombre: base + '.jpg', mime: 'image/jpeg', base64: cv.toDataURL('image/jpeg', 0.82).split(',')[1] });
+        };
+        img.src = fr.result;
+      };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  /** Sube una lista de { file, tipo } a la alarma; quita de la lista las que ya se subieron (reintento seguro). */
+  async function subirPendientes(alarmaId, pendientes, progreso) {
+    const total = pendientes.length;
+    while (pendientes.length) {
+      const p = pendientes[0];
+      if (progreso) progreso.textContent = 'Subiendo evidencia ' + (total - pendientes.length + 1) + ' de ' + total + '…';
+      const img = await reducirImagen(p.file, p.tipo === 'samsara' ? 1800 : 1280);
+      await api('api_subirEvidencia', alarmaId, p.tipo, img.nombre, img.mime, img.base64);
+      pendientes.shift();
+    }
+    if (progreso) progreso.textContent = total ? 'Evidencias subidas.' : '';
+  }
+
+  /** Pide el PDF y muestra un botón de descarga (el clic del usuario evita bloqueos del navegador). */
+  async function descargarPdf(ticketId, btn) {
+    if (btn) btn.disabled = true;
+    try {
+      const r = await api('api_reportePdf', ticketId);
+      const bin = atob(r.base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+      abrirModal('Reporte listo', `<div class="info">${esc(r.nombre)} · ${Math.round(bytes.length / 1024)} KB</div>
+        <a class="btn grande" style="text-align:center;text-decoration:none" href="${url}" download="${esc(r.nombre)}">⬇ Descargar PDF</a>
+        <a href="${url}" target="_blank" class="small">o abrir en otra pestaña</a>`, async () => {}, 'Cerrar', true);
+    } catch (e) { toast(errMsg(e)); }
+    if (btn) btn.disabled = false;
+  }
+
+  /** Agregar evidencias a un ticket ya enviado. */
+  function agregarEvidencia(alarmaId) {
+    const pendientes = [];
+    abrirModal('Agregar evidencia', `
+      <label>Tipo<select name="tipo"><option value="foto">Foto de evidencia</option><option value="samsara">Captura de plataforma Samsara</option></select></label>
+      <label>Imágenes (JPG/PNG)<input type="file" name="archivos" accept="image/jpeg,image/png" multiple></label>
+      <div class="muted small">También puedes pegar una captura con Ctrl+V.</div>
+      <div id="f-progreso"></div>`,
+      async (f) => {
+        if (!pendientes.length) {
+          Array.from($('modal-form').archivos.files).forEach((file) => pendientes.push({ file: file, tipo: f.get('tipo') }));
+          (window._pegadas || []).forEach((file) => pendientes.push({ file: file, tipo: f.get('tipo') }));
+          window._pegadas = [];
+        }
+        if (!pendientes.length) throw new Error('Selecciona al menos una imagen.');
+        await subirPendientes(alarmaId, pendientes, $('f-progreso'));
+        toast('Evidencia agregada. Descarga de nuevo el PDF para verla.');
+      }, 'Subir');
+    window._pegadas = [];
+  }
+
+  // Pegar capturas (Ctrl+V) dentro del formulario abierto
+  document.addEventListener('paste', (ev) => {
+    if ($('modal').hidden) return;
+    const items = Array.from((ev.clipboardData && ev.clipboardData.items) || []).filter((it) => it.type.indexOf('image/') === 0);
+    if (!items.length) return;
+    window._pegadas = (window._pegadas || []).concat(items.map((it) => {
+      const f = it.getAsFile();
+      return new File([f], 'captura_' + Date.now() + '.png', { type: f.type });
+    }));
+    const z = $('zona-pegar');
+    if (z) { z.classList.add('lista'); z.textContent = '✓ ' + window._pegadas.length + ' captura(s) pegada(s)'; }
+    else toast(window._pegadas.length + ' captura(s) pegada(s)');
+  });
+
+  // ================= Consola =================
+  function tarjetaAlarma(a, enAtencion, deCompanero) {
+    const mapa = a.lat ? '<a target="_blank" href="' + MAPS_URL + encodeURIComponent(a.lat + ',' + a.lng) + '">Mapa</a>' : '';
+    const evid = esHttps(a.url_origen) ? `<a target="_blank" href="${esc(a.url_origen)}">Evidencia Samsara</a>` : '';
+    const origen = { samsara_seguridad: 'Samsara IA', samsara_alerta: 'Samsara alerta', manual: 'Manual', demo: 'Demo' }[a.origen] || a.origen || '';
+    let acts = '';
+    const sv = esDeSV(a);
+    if (deCompanero) {
+      acts = `<button class="btn sec" onclick="nota('${esc(a.id)}','')">Nota</button>
+              <button class="btn sec" onclick="historial('${esc(a.id)}')">Historial</button>`;
+    } else if (enAtencion && sv) {
+      acts = `<button class="btn" onclick="formReporteSV('${esc(a.id)}')">Registrar reporte</button>
+              <button class="btn sec" onclick="formDescartar('${esc(a.id)}')">Sin reporte</button>
+              <button class="btn sec" onclick="nota('${esc(a.id)}','')">Nota</button>
+              <button class="btn sec" onclick="historial('${esc(a.id)}')">Historial</button>`;
+      if (esSup()) acts += `<button class="btn sec" onclick="asignar('${esc(a.id)}')">Reasignar</button>`;
+    } else if (!enAtencion) {
+      acts = `<button class="btn" onclick="tomar('${esc(a.id)}', this)">Tomar</button>`;
+      if (esSup()) acts += `<button class="btn sec" onclick="asignar('${esc(a.id)}')">Asignar</button>`;
+    } else {
+      acts = `<button class="btn" onclick="formTicket('${esc(a.id)}')">Enviar ticket</button>
+              <button class="btn sec" onclick="formDescartar('${esc(a.id)}')">Descartar</button>
+              <button class="btn sec" onclick="nota('${esc(a.id)}','')">Nota</button>
+              <button class="btn sec" onclick="historial('${esc(a.id)}')">Historial</button>`;
+      if (esSup()) acts += `<button class="btn sec" onclick="asignar('${esc(a.id)}')">Reasignar</button>`;
+    }
+    const relevo = a.notas && String(a.notas).indexOf('Relevo (') !== -1 ? `<div class="meta">📝 ${esc(String(a.notas).split('\n').pop())}</div>` : '';
+    return `<div class="card ${esc(a.severidad)}">
+      <div class="top"><span class="titulo">${esc(a.categoria || a.tipo_evento)} · ${esc(a.unidad_id || 'Unidad ?')}${Number(a.repeticiones) > 1 ? ' <span class="pill rojo" title="Se repitió; la última a las ' + hora(a.ultima_en) + '">×' + Number(a.repeticiones) + '</span>' : ''}${sv && C && C.bandejas && C.bandejas.length > 1 ? ' ' + pill('Seguridad Vial', 'morado') : ''}${!sv && C && C.mi_estacion && a.estacion_id && a.estacion_id !== C.mi_estacion ? ' ' + pill(nombreEstacion(a.estacion_id), 'morado') : ''}</span>${timerDesde(a.recibida_en)}</div>
+      <div class="meta">${esc(a.tipo_evento)} · ${esc(a.operador || 'operador ?')} · ${pill(a.severidad || 's/sev', { critica: 'rojo', alta: 'amarillo', media: 'gris', baja: 'gris' }[a.severidad] || 'gris')}</div>
+      <div class="meta">${sv ? 'Seguridad Vial' : esc(nombreEstacion(a.estacion_id))} · ${esc(origen)} · recibida ${hora(a.recibida_en)}${a.direccion ? ' · ' + esc(a.direccion) : ''}</div>
+      ${enAtencion ? `<div class="meta">Atiende: <b>${esc(a.asignado_a)}</b> desde ${hora(a.tomada_en)}</div>` : ''}
+      ${relevo}
+      <div class="acts">${acts} ${mapa} ${evid}</div>
+    </div>`;
+  }
+
+  const SLA_PILL = { sin_sla: ['Seguridad Vial', 'morado'], en_tiempo: ['En tiempo', 'verde'], primer_estatus_vencido: ['Sin 1er estatus', 'amarillo'], escalar: ['Escalar', 'rojo'], escalado: ['Escalado', 'morado'] };
+
+  function renderConsola() {
+    $('n-nuevas').textContent = C.nuevas.length;
+    $('n-atencion').textContent = C.enAtencion.length;
+    $('n-tickets').textContent = C.tickets.length;
+    $('lst-nuevas').innerHTML = C.nuevas.length ? C.nuevas.map((a) => tarjetaAlarma(a, false)).join('') : '<div class="empty">Sin alarmas nuevas 👍</div>';
+    const comp = C.companeros || [];
+    $('lst-atencion').innerHTML = (C.enAtencion.length ? C.enAtencion.map((a) => tarjetaAlarma(a, true)).join('') : '<div class="empty">No tienes alarmas en atención</div>') +
+      (comp.length ? '<div class="subtitulo" style="margin-top:10px">Atendiendo mis compañeros (' + comp.length + ')</div>' + comp.map((a) => tarjetaAlarma(a, true, true)).join('') : '');
+    const criticas = C.nuevas.filter((a) => a.severidad === 'critica').length;
+    $('contadores').innerHTML = criticas ? `<b class="ko">${criticas} crítica(s) sin tomar</b>` : '';
+
+    $('tbl-tickets').innerHTML = !C.tickets.length ? '<div class="empty">Sin tickets abiertos</div>' :
+      '<table><thead><tr><th>Folio</th><th>Unidad</th><th>Categoría</th><th>Zona</th><th>Monitorista</th><th>Envío</th><th>1er estatus</th><th>Escalamiento</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      C.tickets.map((t) => {
+        const envio = t.enviado_en ? `<span class="ok">✓ ${hora(t.enviado_en)}</span>` :
+          `<span class="ko" title="${esc(t.envio_error)}">✗ Error</span> <button class="btn sec" onclick="reenviar('${esc(t.id)}', this)">Reenviar</button>`;
+        const sv = esDeSV(t);
+        const primer = sv ? '<span class="muted">—</span>' : t.primer_estatus_en ? `<span class="ok">✓ ${hora(t.primer_estatus_en)}</span>` : timerHasta(t.sla_primer_estatus_en);
+        const escal = sv ? '<span class="muted">sin SLA</span>' : t.escalado_en ? `Escalado ${hora(t.escalado_en)}` : timerHasta(t.sla_escalamiento_en);
+        const s = SLA_PILL[t.sla] || ['-', 'gris'];
+        return `<tr class="${t.escalado_en ? 'fila-escalada' : ''}"><td>${t.escalado_en ? '⚠ ' : ''}<b>${esc(t.folio)}</b></td><td>${esc(t.unidad_id)}</td>
+          <td>${t.clasificacion === 'Ocurrencia' ? pill('OCURRENCIA', 'rojo') + ' ' : ''}${sv ? pill('SEGURIDAD VIAL', 'morado') + ' ' + esc(t.tipo_evento) : esc(t.categoria)}${t.circuito ? '<br><span class="small muted">' + esc(t.circuito) + (t.respaldo === true ? ' · lista de respaldo' : '') + '</span>' : ''}</td><td>${sv ? '—' : esc(t.zona_riesgo)}</td>
+          <td>${esc(t.monitorista)}</td><td>${envio}</td><td>${primer}</td><td>${escal}</td><td>${pill(s[0], s[1])}</td>
+          <td>${t.primer_estatus_en || sv ? '' : `<button class="btn" onclick="primerEstatus('${esc(t.id)}')">1er estatus</button>`}
+              <button class="btn sec" onclick="nota('${esc(t.alarma_id)}','${esc(t.id)}')">Nota</button>
+              ${t.escalado_en || sv ? '' : `<button class="btn sec" onclick="escalar('${esc(t.id)}')">Escalar</button>`}
+              <button class="btn sec" onclick="cerrarTicket('${esc(t.id)}')">Cerrar</button>
+              <button class="btn sec" onclick="historial('${esc(t.alarma_id)}')">Historial</button>
+              <button class="btn sec" onclick="agregarEvidencia('${esc(t.alarma_id)}')">+ Evidencia</button>
+              <button class="btn sec" onclick="descargarPdf('${esc(t.id)}', this)">PDF</button></td></tr>`;
+      }).join('') + '</tbody></table>';
+
+    const sync = $('sync');
+    if (C.sync.error) { sync.className = 'err'; sync.textContent = 'Samsara: error ' + C.sync.error.slice(0, 80); }
+    else if (C.sync.ultima) { sync.className = 'muted'; sync.textContent = 'Samsara ' + hora(C.sync.ultima); }
+    else { sync.className = 'muted'; sync.textContent = 'Samsara: sin conectar'; }
+
+    if (esSup()) {
+      $('filtro-estacion-wrap').hidden = false;
+      $('filtro-estacion').innerHTML = '<option value="">Todas</option>' + opciones(C.estaciones.map((e) => ({ v: e.id, t: e.nombre })), store.get('estacion') || '');
+    }
+    const variasAreas = !!(C.bandejas && C.bandejas.length > 1);
+    $('filtro-bandeja-wrap').hidden = !variasAreas;
+    if (variasAreas) $('filtro-bandeja').innerHTML = '<option value="">Todas</option>' + opciones(C.bandejas.map((b) => ({ v: b, t: C.nombresBandeja[b] || b })), store.get('bandeja') || '');
+    tick();
+  }
+
+  // ---- Acciones de alarmas ----
+  async function tomar(id, btn) {
+    btn.disabled = true;
+    try { await api('api_tomarAlarma', id); toast('Alarma tomada'); } catch (e) { toast(errMsg(e)); }
+    refrescar();
+  }
+  function asignar(id) {
+    const a = C.nuevas.concat(C.enAtencion).find((x) => x.id === id) || {};
+    const sv = esDeSV(a);
+    const us = (C.usuarios || []).filter((u) => (u.bandeja || 'monitoreo') === (sv ? 'seguridad_vial' : 'monitoreo'));
+    if (!us.length) { toast(sv ? 'No hay analistas de Seguridad Vial activos.' : 'No hay monitoristas en turno.'); return; }
+    abrirModal('Asignar alarma', `<label>${sv ? 'Analista de Seguridad Vial' : 'Monitorista en turno'}<select name="login">${opciones(us.map((u) => ({ v: u.login, t: u.login + (sv ? '' : ' · ' + nombreEstacion(u.estacion_id)) })))}</select></label>`,
+      (f) => api('api_reasignarAlarma', id, f.get('login')), 'Asignar');
+  }
+  function formDescartar(id) {
+    const a = (C.enAtencion || []).find((x) => x.id === id) || {};
+    if (esDeSV(a)) {
+      abrirModal('Cerrar sin reporte', `
+        <div class="info small">Usa esta opción cuando la revisión no confirma una conducta de riesgo. Cuenta como evento revisado en tu desempeño.</div>
+        <label>Resultado<select name="resultado">${opciones(C.resultadosSV || [])}</select></label>
+        <label>¿Qué se revisó? (obligatorio)<textarea name="nota" placeholder="Ej. Se revisó el video: el conductor bebe agua; sin conducta de riesgo."></textarea></label>`,
+        (f) => api('api_descartarAlarma', id, f.get('resultado'), f.get('nota')), 'Cerrar sin reporte');
+      return;
+    }
+    abrirModal('Descartar alarma', `
+      <label>Resultado<select name="resultado">${opciones(C.resultadosDescarte)}</select></label>
+      <label>¿Cómo se validó? (obligatorio)<textarea name="nota" placeholder="Ej. Se revisó video: el operador usaba manos libres; se llamó y confirma sin novedad."></textarea></label>`,
+      (f) => api('api_descartarAlarma', id, f.get('resultado'), f.get('nota')), 'Descartar');
+  }
+  // ---- Catálogos del ticket (se cargan una vez y se guardan 10 min) ----
+  let CT = null, CT_EN = 0;
+  async function catalogoTicket() {
+    if (!CT || Date.now() - CT_EN > 600000) { CT = await api('api_catalogoTicket'); CT_EN = Date.now(); }
+    return CT;
+  }
+  const datalist = (idDl, valores) => `<datalist id="${idDl}">${valores.map((v) => `<option value="${esc(v)}"></option>`).join('')}</datalist>`;
+  function opcionesTipos(sel) {
+    const grupo = (cl) => CT.tipos.filter((t) => t.clasificacion === cl)
+      .map((t) => `<option value="${esc(t.id)}" ${t.id === sel ? 'selected' : ''}>${esc(t.nombre)}</option>`).join('');
+    return `<option value="">— Selecciona —</option><optgroup label="Ocurrencia (siniestro: escalamiento inmediato)">${grupo('Ocurrencia')}</optgroup>` +
+      `<optgroup label="Incidencia">${grupo('Incidencia')}</optgroup>`;
+  }
+  /** Listas que recibirían un ticket de ese tipo en ese circuito (o la de respaldo). */
+  function destinoPrevio(circuitoId, tipoId) {
+    if (!circuitoId || !tipoId) return '<span class="muted">Elige el tipo de incidencia y el circuito para ver a quién se enviará.</span>';
+    const ls = (CT.listas[circuitoId] || []).filter((l) => l.tipo_ids.indexOf(tipoId) !== -1);
+    if (ls.length) return 'Se enviará a: <b>' + ls.map((l) => esc(l.nombre) + ' (' + l.n + ' correos)').join(', ') + '</b>';
+    return '<span class="ko">⚠ Este circuito no tiene lista para ese tipo.</span> Se enviará a la <b>' +
+      esc(CT.respaldo ? CT.respaldo.nombre + ' (' + CT.respaldo.n + ' correos)' : 'lista de respaldo') + '</b>.';
+  }
+
+  async function formTicket(id) {
+    const a = C.enAtencion.find((x) => x.id === id);
+    try { await catalogoTicket(); } catch (e) { toast(errMsg(e)); return; }
+    const prev = (C.previos && C.previos[a.unidad_id]) || {};
+    const ya = (C.evidencias && C.evidencias[a.id]) || [];
+    const yaSamsara = ya.filter((e) => e.tipo === 'samsara').length;
+    const yaFotos = ya.filter((e) => e.tipo !== 'samsara').length;
+    // Campo con sugerencias del catálogo; acepta texto nuevo (queda "Por validar")
+    const campo = (name, label, valor, ph, dl) => `<label>${label}<input name="${name}" value="${esc(valor || '')}" placeholder="${esc(ph || '')}" ${dl ? 'list="' + dl + '"' : ''} autocomplete="off"></label>`;
+    const candidatos = a.circuitos_unidad || [];
+    const nombreCirc = (cid) => { const c = CT.circuitos.find((x) => x.id === cid); return c ? c.nombre : '?'; };
+    const opcCirc = (candidatos.length ? '' : '<option value="">— Selecciona el circuito —</option>') +
+      (candidatos.length ? `<optgroup label="De la unidad (Samsara)">${candidatos.map((cid) => `<option value="${esc(cid)}">${esc(nombreCirc(cid))}</option>`).join('')}</optgroup>` : '') +
+      `<optgroup label="${candidatos.length ? 'Otro circuito' : 'Circuitos'}">${CT.circuitos.filter((c) => candidatos.indexOf(c.id) === -1).map((c) => `<option value="${esc(c.id)}">${esc(c.nombre)}</option>`).join('')}</optgroup>`;
+    const avisoCirc = candidatos.length > 1 ? '<div class="info small">Unidad prestada: está en <b>' + candidatos.map((c) => esc(nombreCirc(c))).join(' y ') + '</b>. Confirma el circuito donde ocurrió.</div>'
+      : (candidatos.length ? '' : '<div class="info small">La unidad no tiene circuito en Samsara (p. ej. GPS portátil): <b>elige el circuito</b>.</div>');
+    const html = `
+      <div class="info">Unidad <b>${esc(a.unidad_id)}</b> · ${esc(a.tipo_evento)} · recibida ${hora(a.recibida_en)} (${timerDesde(a.recibida_en)})
+        ${prev.ruta || prev.remolque1 ? '<br><span class="small">Datos precargados del último ticket de esta unidad; revísalos.</span>' : ''}</div>
+
+      <div class="subtitulo">Incidencia</div>
+      <div class="grid2">
+        <label>Tipo de incidencia<select name="tipo_id" id="f-tipo">${opcionesTipos(a.tipo_sugerido || '')}</select></label>
+        <label>Circuito<select name="circuito_id" id="f-circ">${opcCirc}</select></label>
+        <label>Zona de riesgo<select name="zona_riesgo">${opciones([{ v: '', t: '— Selecciona —' }, { v: 'alta', t: 'Alto riesgo' }, { v: 'segura', t: 'Zona segura' }, { v: 'amenaza_inmediata', t: 'AMENAZA INMEDIATA (escala ya)' }])}</select></label>
+        ${campo('lugar', 'Lugar de incidencia', a.direccion, 'Carretera, km, referencia')}
+      </div>
+      ${avisoCirc}
+      <div class="info" id="f-destino"></div>
+
+      <div class="subtitulo">Datos de la unidad</div>
+      <div class="grid3">
+        ${campo('remolque1', 'Remolque #1', prev.remolque1, '', 'dl-remolque')}
+        ${campo('remolque2', 'Remolque #2', prev.remolque2, '', 'dl-remolque')}
+        ${campo('dolly', 'Dolly', prev.dolly, '', 'dl-dolly')}
+      </div>
+
+      <div class="subtitulo">Conductor y operación</div>
+      <div class="grid3">
+        ${campo('operador', 'Conductor', a.operador || prev.operador, '', 'dl-conductor')}
+        ${campo('supervisor', 'Supervisor', prev.supervisor, 'Del circuito elegido', 'dl-supervisor')}
+        ${campo('ruta', 'Ruta', prev.ruta, 'ORIGEN - DESTINO', 'dl-ruta')}
+        ${campo('operacion', 'Operación', prev.operacion, '', 'dl-cliente')}
+        ${campo('cliente', 'Cliente', prev.cliente, '', 'dl-cliente')}
+      </div>
+      <div class="muted small">Si escribes un nombre que no está en la lista, se guarda y queda "Por validar" para que supervisión lo revise.</div>
+      ${datalist('dl-remolque', CT.catalogos.remolque)}${datalist('dl-dolly', CT.catalogos.dolly)}${datalist('dl-conductor', CT.catalogos.conductor)}
+      ${datalist('dl-ruta', CT.catalogos.ruta)}${datalist('dl-cliente', CT.catalogos.cliente)}<datalist id="dl-supervisor"></datalist>
+
+      <div class="subtitulo">Descripción</div>
+      <label>Descripción detallada de la incidencia<textarea name="descripcion" placeholder="Qué pasó, qué se observó en video/GPS, condición del operador y la unidad."></textarea></label>
+      <div class="grid2">
+        <label>Acciones realizadas<textarea name="acciones" placeholder="Ej. Llamada al operador 10:42, se notificó a taller..."></textarea></label>
+        <label>Contacto con el operador<select name="contacto_operador">${opciones(['Contactado - confirma evento', 'Contactado - niega evento', 'No contesta', 'No aplica'])}</select></label>
+      </div>
+
+      <div class="subtitulo">Evidencias</div>
+      <div class="grid2">
+        <label>Captura de plataforma Samsara ${yaSamsara ? '(ya subida ✓)' : ''}
+          <input type="file" name="samsara" accept="image/jpeg,image/png" ${yaSamsara ? 'disabled' : ''}>
+          <div class="zona-pegar" id="zona-pegar">o pega aquí la captura con Ctrl+V</div></label>
+        <label>Fotos de evidencia (hasta ${C.maxFotos - yaFotos}) ${yaFotos ? '· ya subidas: ' + yaFotos : ''}
+          <input type="file" name="fotos" accept="image/jpeg,image/png" multiple></label>
+      </div>
+      <div id="f-progreso"></div>`;
+
+    const pendientes = [];
+    let preparadas = false;
+    window._pegadas = [];
+    abrirModal('Enviar ticket de incidencia', html, async (f) => {
+      // Validar antes de subir fotos
+      if (!f.get('tipo_id')) throw new Error('Selecciona el tipo de incidencia.');
+      if (!f.get('circuito_id')) throw new Error('Selecciona el circuito.');
+      if (!f.get('zona_riesgo')) throw new Error('Selecciona la zona de riesgo.');
+      if (String(f.get('descripcion') || '').trim().length < 10) throw new Error('Describe la incidencia (mínimo 10 caracteres).');
+      if (!preparadas) {
+        const form = $('modal-form');
+        const samsara = Array.from(form.samsara.files || []).concat(window._pegadas || []).slice(0, Math.max(0, 1 - yaSamsara));
+        const fotos = Array.from(form.fotos.files || []);
+        if (fotos.length > C.maxFotos - yaFotos) throw new Error('Máximo ' + (C.maxFotos - yaFotos) + ' fotos más.');
+        samsara.forEach((file) => pendientes.push({ file: file, tipo: 'samsara' }));
+        fotos.forEach((file) => pendientes.push({ file: file, tipo: 'foto' }));
+        preparadas = true;
+      }
+      await subirPendientes(id, pendientes, $('f-progreso'));
+      $('f-progreso').textContent = 'Enviando ticket y generando reporte PDF…';
+      const datos = {};
+      ['tipo_id', 'circuito_id', 'zona_riesgo', 'lugar', 'remolque1', 'remolque2', 'dolly', 'operador', 'supervisor',
+       'ruta', 'operacion', 'cliente', 'descripcion', 'acciones', 'contacto_operador'].forEach((k) => { datos[k] = f.get(k); });
+      const t = await api('api_enviarTicket', id, datos);
+      window._pegadas = [];
+      CT = null;   // los "Por validar" nuevos aparecen la próxima vez
+      const pv = t.por_validar && t.por_validar.length ? ' · ' + t.por_validar.length + ' dato(s) nuevo(s) quedaron "Por validar"' : '';
+      toast((t.enviado_en ? 'Ticket ' + t.folio + ' enviado' : 'Ticket ' + t.folio + ' creado, pero NO se envió: ' + t.envio_error) + pv);
+    }, 'Enviar ticket', false, true);
+    // Vista previa de destinatarios, aviso de escalamiento inmediato y supervisores del circuito
+    const upd = () => {
+      const tipo = CT.tipos.find((x) => x.id === $('f-tipo').value);
+      $('f-destino').innerHTML = destinoPrevio($('f-circ').value, $('f-tipo').value) +
+        (tipo && tipo.inmediato ? '<br><b class="ko">Ocurrencia: se escalará de inmediato.</b>' : '');
+      const circ = $('f-circ').value;
+      const sups = CT.catalogos.supervisor.filter((s) => !circ || s.c === circ).map((s) => s.n);
+      $('dl-supervisor').innerHTML = sups.map((n) => `<option value="${esc(n)}"></option>`).join('');
+    };
+    $('f-tipo').onchange = upd; $('f-circ').onchange = upd; upd(); tick();
+  }
+  /** Seguridad Vial: reporte de una conducta de riesgo comprobada (investigación + evidencias + video). */
+  function formReporteSV(id) {
+    const a = C.enAtencion.find((x) => x.id === id);
+    const ya = (C.evidencias && C.evidencias[a.id]) || [];
+    const yaSamsara = ya.filter((e) => e.tipo === 'samsara').length;
+    const yaFotos = ya.filter((e) => e.tipo !== 'samsara').length;
+    const campo = (name, label, valor, ph) => `<label>${label}<input name="${name}" value="${esc(valor || '')}" placeholder="${esc(ph || '')}" autocomplete="off"></label>`;
+    const enlace = esHttps(a.url_origen) ? a.url_origen : '';
+    const html = `
+      <div class="info">Unidad <b>${esc(a.unidad_id)}</b> · ${esc(a.tipo_evento)} · ${fecha(a.recibida_en)}${enlace ? ` · <a target="_blank" href="${esc(enlace)}">Ver evento en Samsara</a>` : ''}</div>
+      <div class="info small">Registra un reporte solo si la revisión <b>confirma una conducta de riesgo</b>. Se envía a la <b>Lista Seguridad Vial</b> (gerentes de operaciones, RH y protección patrimonial). Si no hay conducta de riesgo, usa <i>Sin reporte</i>.</div>
+      <div class="subtitulo">Conducta</div>
+      <div class="grid2">
+        ${campo('conducta', 'Conducta detectada', a.tipo_evento, 'Ej. Consumo de bebida alcohólica')}
+        ${campo('operador', 'Conductor', a.operador, '')}
+        ${campo('supervisor', 'Supervisor', '', '')}
+        ${campo('lugar', 'Lugar', a.direccion, 'Carretera, km, referencia')}
+      </div>
+      <div class="subtitulo">Investigación</div>
+      <label>Investigación (qué se observó en el video, contexto, antecedentes del conductor)<textarea name="descripcion" style="min-height:110px" placeholder="Ej. En el video de las 14:32 se observa al conductor tomar una lata de cerveza…"></textarea></label>
+      <label>Acción con el conductor<textarea name="acciones" placeholder="Ej. Llamada al conductor, amonestación, capacitación programada…"></textarea></label>
+      <div class="subtitulo">Evidencias</div>
+      ${campo('url_video', 'Enlace al video (Samsara o Drive)', enlace, 'https:' + '/' + '/…')}
+      <div class="grid2">
+        <label>Captura de Samsara ${yaSamsara ? '(ya subida ✓)' : ''}
+          <input type="file" name="samsara" accept="image/jpeg,image/png" ${yaSamsara ? 'disabled' : ''}>
+          <div class="zona-pegar" id="zona-pegar">o pega aquí la captura con Ctrl+V</div></label>
+        <label>Imágenes del video (hasta ${C.maxFotos - yaFotos}) ${yaFotos ? '· ya subidas: ' + yaFotos : ''}
+          <input type="file" name="fotos" accept="image/jpeg,image/png" multiple></label>
+      </div>
+      <div id="f-progreso"></div>`;
+    const pendientes = [];
+    let preparadas = false;
+    window._pegadas = [];
+    abrirModal('Registrar reporte de Seguridad Vial', html, async (f) => {
+      if (!String(f.get('conducta') || '').trim()) throw new Error('Escribe la conducta detectada.');
+      if (String(f.get('descripcion') || '').trim().length < 10) throw new Error('Describe la investigación (mínimo 10 caracteres).');
+      if (!preparadas) {
+        const form = $('modal-form');
+        const samsara = Array.from(form.samsara.files || []).concat(window._pegadas || []).slice(0, Math.max(0, 1 - yaSamsara));
+        const fotos = Array.from(form.fotos.files || []);
+        if (fotos.length > C.maxFotos - yaFotos) throw new Error('Máximo ' + (C.maxFotos - yaFotos) + ' imágenes más.');
+        samsara.forEach((file) => pendientes.push({ file: file, tipo: 'samsara' }));
+        fotos.forEach((file) => pendientes.push({ file: file, tipo: 'foto' }));
+        preparadas = true;
+      }
+      await subirPendientes(id, pendientes, $('f-progreso'));
+      $('f-progreso').textContent = 'Enviando reporte y generando PDF…';
+      const datos = {};
+      ['conducta', 'operador', 'supervisor', 'lugar', 'descripcion', 'acciones', 'url_video'].forEach((k) => { datos[k] = f.get(k); });
+      const t = await api('api_enviarTicket', id, datos);
+      window._pegadas = [];
+      toast(t.enviado_en ? 'Reporte ' + t.folio + ' enviado' : 'Reporte ' + t.folio + ' creado, pero NO se envió: ' + t.envio_error);
+    }, 'Enviar reporte', false, true);
+  }
+  async function abrirManual() {
+    try { await catalogoTicket(); } catch (e) { toast(errMsg(e)); return; }
+    abrirModal('Registrar alarma manual (llamada / radio)', `
+      <label>Unidad (económico)<input name="unidad" placeholder="A-126"></label>
+      <label>Conductor<input name="operador" list="dl-conductor-m" autocomplete="off"></label>
+      <label>Tipo de incidencia<select name="tipo_id">${opcionesTipos('')}</select></label>
+      <label>Detalle del evento<input name="tipo_evento" placeholder="Ej. Ponchadura, reporte de asalto..."></label>
+      <label>Ubicación / referencia<input name="direccion"></label>
+      <label>Nota<textarea name="nota"></textarea></label>
+      ${datalist('dl-conductor-m', CT.catalogos.conductor)}`,
+      (f) => {
+        if (!f.get('tipo_id')) throw new Error('Selecciona el tipo de incidencia.');
+        return api('api_registrarAlarmaManual', Object.fromEntries(f.entries())).then(() => toast('Alarma registrada y asignada a ti'));
+      }, 'Registrar');
+  }
+  function nota(alarmaId, ticketId) { pedirTexto('Agregar nota de seguimiento', 'Nota', (t) => api('api_nota', alarmaId, ticketId, t)); }
+  async function historial(alarmaId) {
+    try {
+      const h = await api('api_historial', alarmaId);
+      abrirModal('Historial', '<div class="hist">' + (h.length ? h.map((x) =>
+        `<div><b>${fecha(x.creado_en)}</b> · ${esc(x.usuario)} · <i>${esc(x.accion)}</i><br>${esc(x.nota)}</div>`).join('') : 'Sin registros') + '</div>',
+        async () => {}, 'Cerrar', true);
+    } catch (e) { toast(errMsg(e)); }
+  }
+
+  // ---- Acciones de tickets ----
+  function primerEstatus(id) { pedirTexto('Primer estatus', 'Estatus reportado por operador / área', (t) => api('api_primerEstatus', id, t)); }
+  function escalar(id) { pedirTexto('Escalar ticket', 'Motivo del escalamiento', (t) => api('api_escalarTicket', id, t), 'Escalar'); }
+  function cerrarTicket(id) { pedirTexto('Cerrar ticket', 'Conclusión del servicio (cómo se resolvió)', (t) => api('api_cerrarTicket', id, t), 'Cerrar ticket'); }
+  async function reenviar(id, btn) {
+    btn.disabled = true;
+    try { await api('api_reenviarTicket', id); toast('Ticket reenviado'); } catch (e) { toast(errMsg(e)); }
+    refrescar();
+  }
+
+  // ================= Usuarios =================
+  let U = null;
+  function renderUsuarios() {
+    const q = ($('u-buscar').value || '').toLowerCase();
+    const filas = U.usuarios.filter((u) => !q || (u.usuario + ' ' + u.nombre).toLowerCase().indexOf(q) !== -1);
+    const est = (id) => { const e = U.estaciones.find((x) => x.id === id); return e ? e.nombre : '-'; };
+    $('tbl-usuarios').innerHTML = '<table><thead><tr><th>Usuario</th><th>Nombre</th><th>Rol</th><th>Turno base</th><th>Estación sugerida</th><th>Estado</th><th>Último acceso</th><th></th></tr></thead><tbody>' +
+      filas.map((u) => `<tr><td><b>${esc(u.usuario)}</b></td><td>${esc(u.nombre)}</td><td>${esc(u.rol)}${u.rol === 'Supervisor' ? '<br><span class="small muted">Jefe de ' + esc(u.area ? (U.bandejas || NOMBRE_BANDEJA)[u.area] : 'todas las áreas') + '</span>' : ''}</td><td>${esc(u.turno_base || '-')}</td><td>${esc(est(u.estacion_id))}</td>
+        <td>${!u.activo ? pill('Inactivo', 'gris') : u.bloqueado ? pill('Bloqueado', 'rojo') : u.debe_cambiar_password ? pill('Clave temporal', 'amarillo') : pill('Activo', 'verde')}</td>
+        <td>${fecha(u.ultimo_acceso)}</td>
+        <td><button class="btn sec" onclick="formUsuario('${esc(u.id)}')">Editar</button>
+            <button class="btn sec" onclick="resetClave('${esc(u.id)}','${esc(u.usuario)}')">Restablecer clave</button></td></tr>`).join('') + '</tbody></table>';
+    const ests = U.estaciones.slice().sort((a, b) => (a.activa === false) - (b.activa === false) || String(a.nombre).localeCompare(String(b.nombre)));
+    $('tbl-estaciones').innerHTML = !ests.length ? '<div class="empty">Sin estaciones. Pulsa "Sincronizar desde Samsara".</div>' :
+      '<table><thead><tr><th>Estación</th><th>Unidades</th><th title="Las estaciones del mismo grupo ven y atienden las alarmas de las otras">Grupo de apoyo</th><th>Origen</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      ests.map((e) => `<tr><td><b>${esc(e.nombre)}</b><br><span class="muted small">${esc(e.descripcion || '')}</span></td><td>${e.unidades}</td>
+        <td class="wrap">${e.grupo ? pill(e.grupo, 'morado') + ' <span class="small muted">con ' + esc(ests.filter((x) => x.id !== e.id && x.activa !== false && String(x.grupo || '').trim().toUpperCase() === String(e.grupo).trim().toUpperCase()).map((x) => x.nombre).join(', ') || 'nadie más aún') + '</span>' : '<span class="muted">—</span>'}</td>
+        <td>${e.origen === 'samsara' ? pill('Samsara', 'verde') : pill('Manual', 'gris')}</td>
+        <td>${e.activa === false ? pill('Inactiva', 'gris') : pill('Activa', 'verde')}</td>
+        <td>${esAdmin() && e.origen !== 'samsara' ? `<button class="btn sec" onclick="formEstacion('${esc(e.id)}')">Editar</button> ` : ''}${esAdmin() ? `<button class="btn sec" onclick="formGrupoEstacion('${esc(e.id)}')">Grupo</button>` : ''}</td></tr>`).join('') + '</tbody></table>';
+    $('btn-nueva-estacion').hidden = !esAdmin();
+    const sy = U.sync || {};
+    $('sync-estaciones').innerHTML = sy.error ? `<span class="ko">Error al sincronizar: ${esc(sy.error)}</span>` :
+      `Estaciones = etiquetas dentro de <b>${esc(sy.tag)}</b> en Samsara. Última sincronización: ${sy.ultima ? fecha(sy.ultima) : 'nunca'} (automática cada hora).`;
+  }
+  function formUsuario(id) {
+    const u = id ? U.usuarios.find((x) => x.id === id) : { activo: true, rol: 'Monitorista' };
+    const roles = esAdmin() ? U.roles : U.roles.filter((r) => ['Admin', 'Supervisor'].indexOf(r) === -1);
+    abrirModal(id ? 'Editar usuario' : 'Nuevo usuario', `
+      <label>Usuario (para entrar)<input name="usuario" value="${esc(u.usuario || '')}" placeholder="ej. jperez" autocomplete="off"></label>
+      <label>Nombre completo<input name="nombre" value="${esc(u.nombre || '')}"></label>
+      <label>Rol<select name="rol" id="u-rol">${opciones(roles, u.rol)}</select></label>
+      <label id="u-area-wrap">Jefe de (qué área ve en la consola y en desempeño)<select name="area">${opciones([{ v: '', t: 'Todas las áreas' }].concat(Object.keys(U.bandejas || NOMBRE_BANDEJA).map((b) => ({ v: b, t: (U.bandejas || NOMBRE_BANDEJA)[b] }))), u.area || '')}</select></label>
+      <label>Correo (opcional, para respuestas a sus tickets)<input name="email" type="email" value="${esc(u.email || '')}"></label>
+      <label>Turno base<select name="turno_base">${opciones([{ v: '', t: '—' }].concat(U.turnos.map((t) => ({ v: t.id, t: t.nombre + ' ' + t.inicio + ':00–' + t.fin + ':00' }))), u.turno_base || '')}</select></label>
+      <label>Estación sugerida<select name="estacion_id">${opciones([{ v: '', t: '—' }].concat(U.estaciones.map((e) => ({ v: e.id, t: e.nombre }))), u.estacion_id || '')}</select></label>
+      <label class="checks"><label><input type="checkbox" name="activo" ${u.activo ? 'checked' : ''}> Activo</label></label>
+      ${id ? '' : '<div class="info">Se generará una contraseña temporal que verás una sola vez.</div>'}`,
+      async (f) => {
+        const r = await api('api_guardarUsuario', { id: id || '', usuario: f.get('usuario'), nombre: f.get('nombre'), rol: f.get('rol'), email: f.get('email'),
+          turno_base: f.get('turno_base'), estacion_id: f.get('estacion_id'), activo: f.get('activo') === 'on', area: f.get('area') || '' });
+        await cargar.usuarios();
+        if (r.password_temporal) { mostrarClave(r.usuario.usuario, r.password_temporal); return 'mantener'; }
+      });
+    const updArea = () => { $('u-area-wrap').hidden = $('u-rol').value !== 'Supervisor'; };
+    $('u-rol').onchange = updArea; updArea();
+  }
+  function resetClave(id, usuario) {
+    abrirModal('Restablecer contraseña', `<div class="info">Se generará una contraseña temporal para <b>${esc(usuario)}</b>, se desbloqueará y se cerrarán sus sesiones abiertas.</div>`,
+      async () => { const r = await api('api_restablecerPassword', id); await cargar.usuarios(); mostrarClave(usuario, r.password_temporal); return 'mantener'; }, 'Restablecer');
+  }
+  function formGrupoEstacion(id) {
+    const e = U.estaciones.find((x) => x.id === id);
+    const grupos = U.estaciones.map((x) => String(x.grupo || '').trim()).filter((g, i, l) => g && l.indexOf(g) === i).sort();
+    abrirModal('Grupo de apoyo: ' + e.nombre, `
+      <div class="info small">Las estaciones con el <b>mismo grupo</b> se ayudan: ven las alarmas nuevas de las otras y las pueden tomar, ven qué alarmas atienden sus compañeros (solo para ver y dejar notas) y ven sus tickets en seguimiento. Cada alarma conserva su estación de origen; el desempeño cuenta para quien la atendió.</div>
+      <label>Grupo de apoyo<input name="grupo" list="dl-grupos" value="${esc(e.grupo || '')}" placeholder="Ejemplo: México. Vacío = sin grupo"></label>
+      <datalist id="dl-grupos">${grupos.map((g) => `<option value="${esc(g)}">`).join('')}</datalist>
+      <div class="muted small">Para unir dos estaciones, escribe el mismo nombre de grupo en las dos.</div>`,
+      async (f) => { await api('api_estacionGrupo', id, f.get('grupo') || ''); toast('Grupo guardado'); });
+  }
+  function formEstacion(id) {
+    const e = id ? U.estaciones.find((x) => x.id === id) : { activa: true };
+    abrirModal(id ? 'Editar estación' : 'Nueva estación', `
+      <label>Nombre<input name="nombre" value="${esc(e.nombre || '')}"></label>
+      <label>Descripción (rutas / clientes que cubre)<input name="descripcion" value="${esc(e.descripcion || '')}"></label>
+      <label class="checks"><label><input type="checkbox" name="activa" ${e.activa !== false ? 'checked' : ''}> Activa</label></label>`,
+      (f) => api('api_guardarEstacion', { id: id || '', nombre: f.get('nombre'), descripcion: f.get('descripcion'), activa: f.get('activa') === 'on' }));
+  }
+  $('u-buscar').addEventListener('input', () => U && renderUsuarios());
+
+  /** Resumen de circuitos (GRUPO GAL), conductores y remolques sincronizados con Samsara. */
+  function resumenCatalogos(c) {
+    if (!c) return '';
+    if (c.error) return '<div class="info ko">Circuitos, conductores y remolques: ' + esc(c.error) + '</div>';
+    const f = (x) => (x ? `${x.recibidos} en Samsara · ${x.nuevos} nuevos · ${x.vinculados} vinculados · ${x.desactivados} desactivados` + (x.dados_de_baja ? ` · ${x.dados_de_baja} de baja` : '') : 'no se pudo');
+    const ci = c.circuitos;
+    return `<div class="subtitulo">Circuitos (etiqueta GRUPO GAL)</div>
+      <div class="info">${ci.unidades_con_circuito} unidades con circuito · ${ci.unidades_cambiaron} cambiaron · ${ci.unidades_nuevas} nuevas<br>
+        Remolques/dollys/mamparas retirados de unidades: ${ci.retirados_de_unidades || 0}<br>
+        Unidades activas sin circuito: <b>${ci.unidades_sin_circuito}</b>${ci.ejemplos_sin_circuito.length ? ' (p. ej. ' + esc(ci.ejemplos_sin_circuito.join(', ')) + ')' : ''}</div>
+      ${ci.etiquetas_nuevas_sin_asignar.length ? '<div class="info ko">Etiquetas nuevas sin asignar: ' + esc(ci.etiquetas_nuevas_sin_asignar.join(', ')) + '</div>' : ''}
+      ${ci.conflictos.length ? '<div class="info">Unidades en dos circuitos: ' + esc(ci.conflictos.join(' | ')) + '</div>' : ''}
+      <div class="subtitulo">Conductores, remolques y dollys</div>
+      <div class="info">Conductores activos: ${f(c.conductores)}<br>Remolques: ${f(c.remolques && c.remolques.remolques)}<br>Dollys: ${f(c.remolques && c.remolques.dollys)}</div>
+      ${c.errores && c.errores.length ? '<div class="info ko">' + esc(c.errores.join(' | ')) + '<br>Revisa que el token de Samsara tenga los permisos Read Drivers y Read Trailers.</div>' : ''}`;
+  }
+
+  async function sincronizarEstaciones(btn) {
+    btn.disabled = true;
+    try {
+      const r = await api('api_sincronizarEstaciones');
+      await cargar.usuarios();
+      abrirModal('Sincronización con Samsara', `
+        <div class="info">${r.estaciones_nuevas} estación(es) nueva(s), ${r.estaciones_actualizadas} actualizada(s), ${r.estaciones_desactivadas} desactivada(s).<br>
+          ${r.unidades_nuevas} unidad(es) nueva(s), ${r.unidades_actualizadas} cambiaron de estación, ${r.unidades_sin_estacion} quedaron sin estación.<br>
+          ${r.alarmas_reubicadas} alarma(s) nuevas reubicadas.</div>
+        <div class="hist">${r.estaciones.map((x) => '<div>' + esc(x) + '</div>').join('')}</div>
+        ${r.conflictos.length ? '<div class="info"><b>Unidades en dos estaciones:</b><br>' + r.conflictos.map(esc).join('<br>') + '</div>' : ''}
+        ${resumenCatalogos(r.catalogos)}`,
+        async () => {}, 'Listo', true, true);
+    } catch (e) { toast(errMsg(e)); await cargar.usuarios().catch(() => {}); }
+    btn.disabled = false;
+  }
+
+  /** Desempeño de Seguridad Vial: eventos revisados y cuánto tardaron (sin turnos ni SLA). */
+  function renderDesempenoSV(r) {
+    const T = r.totales;
+    $('kpis').innerHTML = [
+      ['Eventos recibidos', T.recibidas], ['Sin revisar ahora', T.sin_tomar],
+      ['Más antiguo sin revisar', T.mas_antigua_sin_tomar_min !== null ? T.mas_antigua_sin_tomar_min + ' min' : '-'],
+      ['Reportes enviados', T.tickets], ['Sin reporte', T.descartadas],
+    ].map((k) => `<div class="kpi"><div class="v">${esc(k[1])}</div><div class="l">${esc(k[0])}</div></div>`).join('');
+    const n = (v) => (v === null || v === undefined ? '-' : v);
+    $('tbl-desempeno').innerHTML = !r.monitoristas.length ? '<div class="empty">Sin actividad en el periodo</div>' :
+      '<table><thead><tr><th>Analista</th><th>Revisados</th><th>Reportes</th><th>Sin reporte</th><th>Pendientes</th><th title="De que llega el evento a que se toma">Prom. tomar (min)</th><th title="De tomarlo a enviar el reporte o cerrarlo sin reporte">Prom. revisión (min)</th><th>Errores envío</th></tr></thead><tbody>' +
+      r.monitoristas.map((m) => `<tr><td><b>${esc(m.nombre)}</b><br><span class="muted small">${esc(m.login)}</span></td>
+        <td>${m.atendidas}</td><td>${m.tickets}</td><td>${m.descartadas}</td><td>${m.abiertas}</td>
+        <td>${n(m.prom_min_tomar)}</td><td>${n(m.prom_min_revision)}</td><td>${m.tickets_error_envio ? `<span class="ko">${m.tickets_error_envio}</span>` : 0}</td></tr>`).join('') + '</tbody></table>';
+  }
+
+  // ================= Pestañas =================
+  const cargar = {
+    async consola() { C = await api('api_consola', esSup() ? (store.get('estacion') || '') : '', esSup() ? (store.get('bandeja') || '') : ''); renderConsola(); },
+    async desempeno() {
+      const desde = new Date($('d-desde').value + 'T00:00:00'), hasta = new Date($('d-hasta').value + 'T23:59:59');
+      const turno = $('d-turno').value;
+      const r = esSup() ? await api('api_desempeno', desde.toISOString(), hasta.toISOString(), $('d-estacion').value, turno, $('d-bandeja').value)
+                        : await api('api_miDesempeno', desde.toISOString(), hasta.toISOString(), turno);
+      if (esSup()) {
+        $('d-estacion-wrap').hidden = false;
+        const ds = $('d-estacion'); const v = ds.value;
+        ds.innerHTML = '<option value="">Todas</option>' + opciones(S.estaciones.map((e) => ({ v: e.id, t: e.nombre })), v);
+      }
+      const variasAreas = !!(r.bandejas && r.bandejas.length > 1);
+      $('d-bandeja-wrap').hidden = !variasAreas;
+      if (variasAreas) $('d-bandeja').innerHTML = opciones(r.bandejas.map((b) => ({ v: b, t: NOMBRE_BANDEJA[b] || b })), r.bandeja);
+      $('meta-ticket').textContent = r.meta_ticket_min;
+      const T = r.totales;
+      if (r.bandeja === 'seguridad_vial') { renderDesempenoSV(r); return; }
+      $('kpis').innerHTML = [
+        ['Alarmas recibidas', T.recibidas], ['Sin tomar ahora', T.sin_tomar],
+        ['Más antigua sin tomar', T.mas_antigua_sin_tomar_min !== null ? T.mas_antigua_sin_tomar_min + ' min' : '-'],
+        ['Tickets enviados', T.tickets], ['Descartadas', T.descartadas], ['Turnos trabajados', T.turnos],
+      ].map((k) => `<div class="kpi"><div class="v">${esc(k[1])}</div><div class="l">${esc(k[0])}</div></div>`).join('');
+      const n = (v) => (v === null || v === undefined ? '-' : v);
+      const semaf = (v, meta) => (v === null ? '-' : `<span class="${v <= meta ? 'ok' : 'ko'}">${v}</span>`);
+      const pctC = (v) => (v === null ? '-' : `<span class="${v >= 90 ? 'ok' : v >= 70 ? '' : 'ko'}">${v}%</span>`);
+      $('tbl-desempeno').innerHTML = !r.monitoristas.length ? '<div class="empty">Sin actividad en el periodo</div>' :
+        '<table><thead><tr><th>Monitorista</th><th>Turnos</th><th>Horas</th><th>Retardos</th><th>Atendidas</th><th>Alarmas/h</th><th>Prom. tomar</th><th>Tickets</th><th>Prom. ticket</th><th>Ticket en meta</th><th>1er estatus en SLA</th><th>Escalados</th><th>Descartadas</th><th>Errores envío</th><th>Prom. cierre</th></tr></thead><tbody>' +
+        r.monitoristas.map((m) => `<tr><td><b>${esc(m.nombre)}</b><br><span class="muted small">${esc(m.login)}${m.turno_base ? ' · ' + esc(m.turno_base) : ''}</span></td>
+          <td>${m.turnos}</td><td>${m.horas_turno}</td><td>${m.retardos ? `<span class="ko">${m.retardos}</span>` : 0}</td>
+          <td>${m.atendidas}</td><td>${n(m.alarmas_por_hora)}</td><td>${semaf(m.prom_min_tomar, r.meta_ticket_min / 2)}</td><td>${m.tickets}</td>
+          <td>${semaf(m.prom_min_ticket, r.meta_ticket_min)}</td><td>${pctC(m.pct_ticket_en_meta)}</td><td>${pctC(m.pct_primer_estatus_sla)}</td>
+          <td>${m.escalados}</td><td>${m.descartadas}</td><td>${m.tickets_error_envio ? `<span class="ko">${m.tickets_error_envio}</span>` : 0}</td><td>${n(m.prom_min_cierre)}</td></tr>`).join('') + '</tbody></table>';
+    },
+    async turnos() {
+      const r = await api('api_panelTurnos');
+      $('turno-actual-titulo').textContent = `En turno ahora · ${r.actual.nombre} (${hora(r.actual.inicio)}–${hora(r.actual.fin)}) · ${r.activos.length} persona(s)`;
+      $('tbl-turnos-activos').innerHTML = !r.activos.length ? '<div class="empty">Nadie ha iniciado turno</div>' :
+        '<table><thead><tr><th>Monitorista</th><th>Estación</th><th>Turno</th><th>Inicio</th><th>Retardo</th><th>En atención</th><th></th></tr></thead><tbody>' +
+        r.activos.map((t) => `<tr><td><b>${esc(t.nombre)}</b> <span class="muted small">${esc(t.usuario)}</span></td><td>${esc(nombreEstacion(t.estacion_id))}</td>
+          <td>${esc(t.turno)}</td><td>${hora(t.inicio_en)}</td><td>${Number(t.retardo_min) > 10 ? `<span class="ko">${t.retardo_min} min</span>` : (t.retardo_min || 0) + ' min'}</td>
+          <td>${t.alarmas_en_atencion}</td><td><button class="btn sec" onclick="forzarEntrega('${esc(t.id)}','${esc(t.nombre)}')">Cerrar turno</button></td></tr>`).join('') + '</tbody></table>';
+      $('tbl-entregas').innerHTML = !r.entregas.length ? '<div class="empty">Sin entregas</div>' :
+        '<table><thead><tr><th>Monitorista</th><th>Estación</th><th>Turno</th><th>Horario</th><th>Devueltas</th><th>Tickets abiertos</th><th>Nota de relevo</th><th>Cerró</th></tr></thead><tbody>' +
+        r.entregas.map((t) => `<tr><td>${esc(t.nombre)}</td><td>${esc(nombreEstacion(t.estacion_id))}</td><td>${esc(t.turno)}</td><td>${hora(t.inicio_en)}–${hora(t.fin_en)}</td>
+          <td>${t.alarmas_devueltas || 0}</td><td>${t.tickets_abiertos || 0}</td><td class="wrap">${esc(t.nota_entrega)}</td><td>${esc(t.cerrado_por)}</td></tr>`).join('') + '</tbody></table>';
+    },
+    async usuarios() { U = await api('api_usuarios'); renderUsuarios(); },
+    async reportes() {
+      const desde = new Date($('r-desde').value + 'T00:00:00'), hasta = new Date($('r-hasta').value + 'T23:59:59');
+      if (esSup()) {
+        $('r-estacion-wrap').hidden = false;
+        const rs = $('r-estacion'); const v = rs.value;
+        rs.innerHTML = '<option value="">Todas</option>' + opciones(S.estaciones.map((e) => ({ v: e.id, t: e.nombre })), v);
+      }
+      const rows = await api('api_reportes', desde.toISOString(), hasta.toISOString(), $('r-estacion').value, $('r-texto').value);
+      const est = { abierto: ['Abierto', 'amarillo'], en_seguimiento: ['En seguimiento', 'amarillo'], escalado: ['Escalado', 'morado'], cerrado: ['Cerrado', 'verde'] };
+      $('tbl-reportes').innerHTML = !rows.length ? '<div class="empty">Sin reportes en el periodo</div>' :
+        '<table><thead><tr><th>Folio</th><th>Fecha</th><th>Unidad</th><th>Conductor</th><th>Incidencia</th><th>Cliente</th><th>Monitorista</th><th>Estación</th><th>Evid.</th><th>Estatus</th><th></th></tr></thead><tbody>' +
+        rows.map((t) => { const s = est[t.estatus] || [t.estatus, 'gris'];
+          return `<tr><td><b>${esc(t.folio)}</b></td><td>${fecha(t.creado_en)}</td><td>${esc(t.unidad_id)}</td><td>${esc(t.operador || '-')}</td>
+            <td>${esDeSV(t) ? pill('SEGURIDAD VIAL', 'morado') + ' ' : ''}${esc(t.tipo_evento || t.categoria)}</td><td>${esc(t.cliente || '-')}</td><td>${esc(t.monitorista)}</td><td>${esDeSV(t) ? '—' : esc(nombreEstacion(t.estacion_id))}</td>
+            <td>${t.evidencias}</td><td>${pill(s[0], s[1])}</td>
+            <td><button class="btn" onclick="descargarPdf('${esc(t.id)}', this)">PDF</button></td></tr>`; }).join('') + '</tbody></table>';
+    },
+    async eta() {
+      const rows = await api('api_listarEta');
+      $('tbl-eta').innerHTML = !rows.length ? '<div class="empty">Sin registros</div>' : '<table><thead><tr><th>Unidad</th><th>Cliente</th><th>Cita</th><th>ETA</th><th>Margen (min)</th><th>Semáforo</th></tr></thead><tbody>' +
+        rows.map((v) => `<tr><td>${esc(v.unidad_id)}</td><td>${esc(v.cliente)}</td><td>${fecha(v.fecha_cita)}</td><td>${fecha(v.eta_proyectado)}</td><td>${v.margen_min}</td><td>${pill(v.semaforo, v.semaforo)}</td></tr>`).join('') + '</tbody></table>';
+    },
+    async inactivas() {
+      const { unidades } = await api('api_listarInactivas');
+      $('tbl-inactivas').innerHTML = !unidades.length ? '<div class="empty">Sin registros</div>' : '<table><thead><tr><th>Unidad</th><th>Inicio de paro</th><th>Horas</th><th>Causa</th><th>Responsable</th><th>Liberación est.</th></tr></thead><tbody>' +
+        unidades.map((r) => `<tr><td>${esc(r.unidad_id)}</td><td>${fecha(r.inicio_paro)}</td><td>${r.horas_inactiva}</td><td>${r.causa ? esc(r.causa) : pill('Sin clasificar', 'rojo')}</td><td>${esc(r.responsable || '-')}</td><td>${fecha(r.liberacion_estimada)}</td></tr>`).join('') + '</tbody></table>';
+    },
+    async capacitacion() {
+      const rows = await api('api_listarCapacitacion');
+      $('tbl-capacitacion').innerHTML = !rows.length ? '<div class="empty">Sin registros</div>' : '<table><thead><tr><th>Operador</th><th>% módulos</th><th>Safety Score</th><th>Revisión</th></tr></thead><tbody>' +
+        rows.map((c) => `<tr><td>${esc(c.operador)}</td><td>${esc(c.modulos_completados_pct ?? '-')}%</td><td>${esc(c.safety_score ?? '-')}</td><td>${esc(c.estatus_revision)}</td></tr>`).join('') + '</tbody></table>';
+    },
+  };
+  function forzarEntrega(turnoId, nombre) {
+    pedirTexto('Cerrar turno de ' + nombre, 'Motivo (sus alarmas en atención regresarán a la cola)', (t) => api('api_forzarEntrega', turnoId, t), 'Cerrar turno');
+  }
+
+  // ================= Configuración: menú lateral por grupos =================
+  let ADM_SUB = 'inicio';
+  let AREAS = [];
+  let PARAMS = null;
+  let BITA = null;
+  let ADM = null;   // datos base: conteos, circuitos, severidades, usos
+  let CFG = null;   // resumen de pendientes (inicio de Configuración)
+  const SUBS = ['inicio', 'usuarios', 'estaciones', 'catalogos', 'tipos', 'circuitos', 'listas', 'alertas', 'etiquetas', 'samsara', 'parametros', 'bitacora', 'areas'];
+  const SUBS_ADMIN = ['tipos', 'circuitos', 'listas', 'etiquetas', 'alertas', 'samsara', 'parametros'];
+  const MENU_CONFIG = [
+    ['', [['inicio', 'Inicio']]],
+    ['Personas y estaciones', [['usuarios', 'Usuarios'], ['estaciones', 'Estaciones y grupos']]],
+    ['Catálogos', [['catalogos', 'Catálogos'], ['tipos', 'Tipos de incidencia'], ['circuitos', 'Circuitos']]],
+    ['Avisos y correos', [['listas', 'Listas y cobertura']]],
+    ['Samsara', [['alertas', 'Alertas y cámaras'], ['etiquetas', 'Etiquetas'], ['samsara', 'Estado de sincronización']]],
+    ['Sistema', [['parametros', 'Parámetros'], ['bitacora', 'Bitácora']]],
+  ];
+  const menuVisible = () => MENU_CONFIG.map((g) => [g[0], g[1].filter((it) => esAdmin() || SUBS_ADMIN.indexOf(it[0]) === -1)]).filter((g) => g[1].length);
+  const nombreSub = (sub) => { let n = sub; MENU_CONFIG.forEach((g) => g[1].forEach((it) => { if (it[0] === sub) n = it[1]; })); return n; };
+  const erroresSamsara = () => (!CFG || !CFG.samsara ? 0 : ['ingesta_error', 'estaciones_error', 'catalogos_error'].filter((k) => CFG.samsara[k]).length);
+  /** Contador de pendientes junto a cada sección del menú. */
+  function cuentaSub(sub) {
+    if (!CFG) return 0;
+    if (sub === 'usuarios') return CFG.personas.bloqueados;
+    if (sub === 'catalogos') return CFG.catalogos.por_validar;
+    if (sub === 'listas' && CFG.avisos) return CFG.avisos.huecos + CFG.avisos.sin_correos.length;
+    if (sub === 'alertas' && CFG.samsara) return CFG.samsara.alertas_nuevas_7d.length + CFG.samsara.alertas_ya_no_existen;
+    if (sub === 'etiquetas' && CFG.samsara) return CFG.samsara.etiquetas_sin_asignar;
+    if (sub === 'samsara') return erroresSamsara();
+    return 0;
+  }
+  function renderMenuConfig() {
+    const g = menuVisible();
+    $('config-menu').innerHTML = g.map((x) => (x[0] ? `<div class="grupo">${esc(x[0])}</div>` : '') + x[1].map((it) => { const n = cuentaSub(it[0]);
+      return `<button class="${it[0] === ADM_SUB ? 'active' : ''}" onclick="abrirSub('${it[0]}')"><span>${esc(it[1])}</span>${n ? '<span class="cuenta">' + n + '</span>' : ''}</button>`; }).join('')).join('');
+    $('config-select').innerHTML = g.map((x) => x[1].map((it) => { const n = cuentaSub(it[0]);
+      return `<option value="${it[0]}" ${it[0] === ADM_SUB ? 'selected' : ''}>${esc((x[0] ? x[0] + ' · ' : '') + it[1] + (n ? ' (' + n + ')' : ''))}</option>`; }).join('')).join('');
+  }
+
+  cargar.config = async function () {
+    if (SUBS.indexOf(ADM_SUB) === -1 || (SUBS_ADMIN.indexOf(ADM_SUB) !== -1 && !esAdmin())) ADM_SUB = 'inicio';
+    try { CFG = await api('api_configResumen'); } catch (e) { CFG = null; toast(errMsg(e)); }
+    await abrirSub(ADM_SUB, true);
+  };
+
+  function prepararAyudas() {
+    document.querySelectorAll('details.ayuda').forEach((d) => {
+      const k = 'ayuda.' + d.dataset.ayuda;
+      try { if (localStorage.getItem(k) === 'cerrada') d.open = false; } catch (e) { }
+      d.addEventListener('toggle', () => { try { localStorage.setItem(k, d.open ? 'abierta' : 'cerrada'); } catch (e) { } });
+    });
+  }
+  let AYUDAS_LISTAS = false;
+  async function abrirSub(sub, sinHistorial) {
+    if (!AYUDAS_LISTAS) { AYUDAS_LISTAS = true; prepararAyudas(); }
+    if (SUBS.indexOf(sub) === -1 || (SUBS_ADMIN.indexOf(sub) !== -1 && !esAdmin())) sub = 'inicio';
+    if (tabActual !== 'config') { ADM_SUB = sub; return abrir('config'); }
+    const cambio = sub !== ADM_SUB;
+    ADM_SUB = sub;
+    if (!sinHistorial && cambio) ruta.guardar();
+    renderMenuConfig();
+    SUBS.forEach((x) => ($('sub-' + x).hidden = x !== sub));
+    try {
+      if (['catalogos', 'circuitos', 'etiquetas', 'listas'].indexOf(sub) !== -1) ADM = await api('api_adminCatalogos');
+      if (sub === 'inicio') renderInicioConfig();
+      if (sub === 'usuarios' || sub === 'estaciones') await cargar.usuarios();
+      if (sub === 'samsara') renderEstadoSamsara();
+      if (sub === 'catalogos') await cargarCatalogo();
+      if (sub === 'tipos') renderTipos(await api('api_tiposAdmin'));
+      if (sub === 'circuitos') renderCircuitos(await api('api_circuitosAdmin'));
+      if (sub === 'listas') { LST = await api('api_listasAdmin'); renderListas(); }
+      if (sub === 'etiquetas') { ETQ = await api('api_etiquetasAdmin'); renderEtiquetas(); }
+      if (sub === 'alertas') { ALR = await api('api_alertasSamsaraAdmin'); renderAlertasSamsara(); }
+      if (sub === 'areas') { AREAS = await api('api_areas'); renderAreas(); }
+      if (sub === 'parametros') { PARAMS = await api('api_parametros'); renderParametros(); }
+      if (sub === 'bitacora') await buscarBitacora();
+    } catch (e) { toast(errMsg(e)); }
+  }
+
+  /** "hace 3 min" / "hace 2 h" / fecha. */
+  function haceCuanto(v) {
+    if (!v) return 'nunca';
+    const min = Math.round((Date.now() - new Date(v).getTime()) / 60000);
+    if (min < 1) return 'hace un momento';
+    if (min < 60) return 'hace ' + min + ' min';
+    if (min < 24 * 60) return 'hace ' + Math.round(min / 60) + ' h';
+    return fecha(v);
+  }
+  /** Inicio de Configuración: una tarjeta por grupo con sus pendientes. Línea = [texto, valor, estado, sección, detalle]. */
+  function renderInicioConfig() {
+    if (!CFG) { $('config-tarjetas').innerHTML = '<div class="empty">No se pudo leer el resumen. Usa el menú.</div>'; return; }
+    const P = CFG.personas, K = CFG.catalogos, A = CFG.avisos, M = CFG.samsara;
+    const n = (v, malo) => (v ? (malo || 'warn') : 'bien');
+    const tarjetas = [['Personas y estaciones', [
+      ['Usuarios activos', P.usuarios_activos, '', 'usuarios'],
+      ['Bloqueados por intentos fallidos', P.bloqueados, n(P.bloqueados), 'usuarios'],
+      ['Con contraseña temporal', P.clave_temporal, P.clave_temporal ? 'warn' : '', 'usuarios'],
+      ['Analistas de Seguridad Vial', P.analistas_sv, P.analistas_sv ? '' : 'warn', 'usuarios'],
+      ['Estaciones activas', P.estaciones_activas, '', 'estaciones'],
+      ['Grupos de apoyo', P.grupos_apoyo, '', 'estaciones'],
+    ]], ['Catálogos', [
+      ['Por validar (escritos por monitoristas)', K.por_validar, n(K.por_validar), 'catalogos'],
+      ['Tipos de incidencia activos', K.tipos_activos, '', 'tipos'],
+      ['Circuitos activos', K.circuitos_activos, '', 'circuitos'],
+    ].filter((l) => esAdmin() || SUBS_ADMIN.indexOf(l[3]) === -1)]];
+    if (A) tarjetas.push(['Avisos y correos', [
+      ['Casillas de la matriz sin lista', A.huecos, n(A.huecos), 'listas'],
+      ['Listas sin correos', A.sin_correos.length, n(A.sin_correos.length, 'bad'), 'listas', A.sin_correos.join(', ')],
+      ['Casillas con 2 listas', A.dobles, A.dobles ? 'warn' : '', 'listas'],
+      ['Listas activas', A.listas_activas, '', 'listas'],
+    ]]);
+    if (M) tarjetas.push(['Samsara', [
+      ['Alarmas (cada minuto)', M.ingesta_error ? 'Error' : haceCuanto(M.ingesta_ultima), M.ingesta_error ? 'bad' : '', 'samsara', M.ingesta_error],
+      ['Estaciones y catálogos (cada hora)', M.estaciones_error || M.catalogos_error ? 'Error' : haceCuanto(M.estaciones_ultima), M.estaciones_error || M.catalogos_error ? 'bad' : '', 'samsara', M.estaciones_error || M.catalogos_error],
+      ['Alertas nuevas esta semana', M.alertas_nuevas_7d.length, n(M.alertas_nuevas_7d.length), 'alertas', M.alertas_nuevas_7d.join(', ')],
+      ['Alertas que ya no existen y aún tienen destino', M.alertas_ya_no_existen, n(M.alertas_ya_no_existen), 'alertas'],
+      ['Etiquetas sin asignar', M.etiquetas_sin_asignar, n(M.etiquetas_sin_asignar), 'etiquetas'],
+    ]]);
+    tarjetas.push(['Sistema', (esAdmin() ? [['Parámetros', 'Tiempos, turnos y accesos', '', 'parametros']] : []).concat([['Bitácora', 'Ver lo que pasó', '', 'bitacora']])]);
+    $('config-tarjetas').innerHTML = tarjetas.map((t) => {
+      const clase = t[1].some((l) => l[2] === 'bad') ? 'error' : t[1].some((l) => l[2] === 'warn') ? 'atencion' : '';
+      return `<div class="tarjeta ${clase}"><h3>${esc(t[0])}</h3><ul>` + t[1].map((l) =>
+        `<li class="${l[2]}" onclick="abrirSub('${l[3]}')" title="${esc(l[4] || 'Ir a ' + nombreSub(l[3]))}"><span>${esc(l[0])}</span><span class="v">${esc(l[1])}</span></li>`).join('') + '</ul></div>';
+    }).join('');
+  }
+  function renderEstadoSamsara() {
+    const M = CFG && CFG.samsara;
+    if (!M) { $('tbl-samsara').innerHTML = '<div class="empty">Sin datos.</div>'; return; }
+    const fila = (que, cada, ultima, error) => `<tr><td><b>${esc(que)}</b><br><span class="muted small">${esc(cada)}</span></td><td>${ultima ? fecha(ultima) + ' <span class="muted small">(' + haceCuanto(ultima) + ')</span>' : '—'}</td>
+      <td class="wrap">${error ? '<span class="ko">' + esc(error) + '</span>' : pill('Sin errores', 'verde')}</td></tr>`;
+    $('tbl-samsara').innerHTML = '<table><thead><tr><th>Qué se lee</th><th>Última lectura</th><th>Estado</th></tr></thead><tbody>' +
+      fila('Alarmas: alertas y eventos de cámara', 'Cada minuto', M.ingesta_ultima, M.ingesta_error) +
+      fila('Estaciones y unidades', 'Cada hora (o con "Sincronizar ahora")', M.estaciones_ultima, M.estaciones_error) +
+      fila('Circuitos, conductores y remolques', 'Cada hora, junto con las estaciones', M.estaciones_ultima, M.catalogos_error) +
+      fila('Lista de alertas configuradas', 'Cada hora (o con "Actualizar" en Alertas)', M.alertas_ultima, '') + '</tbody></table>';
+  }
+
+  /** Dirección por pantalla (#consola, #config/alertas): el botón Atrás del navegador funciona y se puede guardar en favoritos. */
+  const ruta = {
+    hist: () => (window.google && google.script && google.script.history) || null,
+    actual: () => (tabActual === 'config' ? 'config/' + ADM_SUB : tabActual),
+    guardar: function () { try { const h = this.hist(); if (h) h.push(null, null, this.actual()); } catch (e) { } },
+    aplicar: function (hash) {
+      const p = String(hash || '').split('/');
+      if (!p[0]) return false;
+      tabActual = p[0];
+      if (p[0] === 'config' && p[1]) ADM_SUB = p[1];
+      return true;
+    },
+  };
+
+  // ---- Catálogos simples (clientes, supervisores, conductores, remolques, dollys, rutas) ----
+  const NOMBRE_CAT = { cliente: 'Clientes / operaciones', supervisor: 'Supervisores', conductor: 'Conductores', remolque: 'Remolques', dolly: 'Dollys', ruta: 'Rutas' };
+  let CAT = [];
+  const nombreCircuitoAdm = (id) => { const c = (ADM && ADM.circuitos || []).find((x) => x.id === id); return c ? c.nombre : ''; };
+  async function cargarCatalogo() {
+    const sel = $('cat-tipo'); const actual = sel.value || 'cliente';
+    sel.innerHTML = Object.keys(NOMBRE_CAT).map((t) => { const r = ADM.resumen[t] || {};
+      return `<option value="${t}" ${t === actual ? 'selected' : ''}>${esc(NOMBRE_CAT[t])} (${r.total || 0}${r.por_validar ? ' · ' + r.por_validar + ' por validar' : ''})</option>`; }).join('');
+    CAT = await api('api_catalogoListar', sel.value);
+    renderCatalogo();
+  }
+  function renderCatalogo() {
+    const tipo = $('cat-tipo').value;
+    const q = ($('cat-buscar').value || '').toUpperCase();
+    const est = $('cat-estatus').value;
+    const filas = CAT.filter((c) => (!est || c.estatus === est) && (!q || String(c.nombre).toUpperCase().indexOf(q) !== -1 || nombreCircuitoAdm(c.circuito_id).indexOf(q) !== -1));
+    const r = ADM.resumen[tipo] || {};
+    $('cat-info').innerHTML = `${r.activos || 0} activos · ${r.inactivos || 0} inactivos · <b class="${r.por_validar ? 'ko' : ''}">${r.por_validar || 0} por validar</b>` +
+      (['conductor', 'remolque', 'dolly'].indexOf(tipo) !== -1 ? ' · Los marcados "Samsara" se actualizan solos cada hora.' : '') +
+      (filas.length > 400 ? ' · Se muestran 400 de ' + filas.length + '; usa el buscador.' : '');
+    const estPill = (e) => pill(e, e === 'Activo' ? 'verde' : e === 'Por validar' ? 'amarillo' : 'gris');
+    $('tbl-catalogo').innerHTML = !filas.length ? '<div class="empty">Sin registros</div>' :
+      '<table><thead><tr><th>Nombre</th>' + (tipo === 'supervisor' ? '<th>Circuito</th>' : '') + '<th>Estatus</th><th>Origen</th><th>Capturado por</th><th></th></tr></thead><tbody>' +
+      filas.slice(0, 400).map((c) => `<tr><td><b>${esc(c.nombre)}</b></td>${tipo === 'supervisor' ? '<td>' + esc(nombreCircuitoAdm(c.circuito_id) || '—') + '</td>' : ''}
+        <td>${estPill(c.estatus)}</td><td class="small">${esc(c.samsara ? 'Samsara' : c.origen || '')}</td>
+        <td class="small">${esc(c.creado_por || '')}${c.creado_en ? ' · ' + fecha(c.creado_en) : ''}</td>
+        <td><button class="btn sec" onclick="formCatalogo('${esc(c.id)}')">Editar</button>
+            <button class="btn sec" onclick="formUnir('${esc(c.id)}')">Unir con…</button></td></tr>`).join('') + '</tbody></table>';
+  }
+  function formCatalogo(id) {
+    const tipo = $('cat-tipo').value;
+    const c = id ? CAT.find((x) => x.id === id) : { estatus: 'Activo', nombre: '', circuito_id: '' };
+    abrirModal((id ? 'Editar · ' : 'Nuevo · ') + NOMBRE_CAT[tipo], `
+      <label>Nombre<input name="nombre" value="${esc(c.nombre)}"></label>
+      ${tipo === 'supervisor' ? `<label>Circuito<select name="circuito_id">${opciones([{ v: '', t: '— Selecciona —' }].concat(ADM.circuitos.map((x) => ({ v: x.id, t: x.nombre }))), c.circuito_id)}</select></label>` : ''}
+      <label>Estatus<select name="estatus">${opciones(['Activo', 'Inactivo', 'Por validar'], c.estatus)}</select></label>
+      ${c.estatus === 'Por validar' ? '<div class="info small">Capturado por <b>' + esc(c.creado_por) + '</b> en un ticket. Si el nombre es correcto márcalo <b>Activo</b>; si ya existía con otro nombre usa <b>Unir con…</b>.</div>' : ''}
+      ${c.samsara ? '<div class="info small">Viene de Samsara: puedes corregir el nombre o el estatus; se sigue vinculando por su id.</div>' : ''}`,
+      async (f) => { await api('api_catalogoGuardar', { id: id || '', tipo: tipo, nombre: f.get('nombre'), circuito_id: f.get('circuito_id') || '', estatus: f.get('estatus') });
+        toast('Guardado'); CT = null; ADM = await api('api_adminCatalogos'); await cargarCatalogo(); });
+  }
+  function formUnir(id) {
+    const tipo = $('cat-tipo').value;
+    const o = CAT.find((x) => x.id === id);
+    const destinos = CAT.filter((x) => x.id !== id && x.estatus !== 'Inactivo');
+    abrirModal('Unir "' + o.nombre + '"', `
+      <div class="info small">Los tickets que usaron <b>${esc(o.nombre)}</b> pasarán a usar el nombre elegido, y <b>${esc(o.nombre)}</b> quedará inactivo. Útil para corregir lo "Por validar" o quitar duplicados.</div>
+      <label>Unir con (escribe para buscar)<input name="destino" list="dl-unir" autocomplete="off"></label>
+      ${datalist('dl-unir', destinos.map((x) => x.nombre + (tipo === 'supervisor' && x.circuito_id ? ' · ' + nombreCircuitoAdm(x.circuito_id) : '')))}`,
+      async (f) => {
+        const txt = String(f.get('destino') || '');
+        const d = destinos.find((x) => (x.nombre + (tipo === 'supervisor' && x.circuito_id ? ' · ' + nombreCircuitoAdm(x.circuito_id) : '')) === txt) || destinos.find((x) => x.nombre === txt.toUpperCase());
+        if (!d) throw new Error('Elige un registro de la lista.');
+        const r = await api('api_catalogoUnir', id, d.id);
+        toast('Unido: ' + r.tickets_actualizados + ' ticket(s) actualizados'); CT = null; ADM = await api('api_adminCatalogos'); await cargarCatalogo();
+      }, 'Unir');
+  }
+
+  // ---- Tipos de incidencia ----
+  let TIPOS_ADM = [];
+  function renderTipos(t) {
+    TIPOS_ADM = t;
+    $('tbl-tipos').innerHTML = '<table><thead><tr><th>Tipo</th><th>Clasificación</th><th>Severidad</th><th title="Minutos para el primer seguimiento del área">1er estatus</th><th title="Minutos antes de escalar si nadie atiende">Escalamiento</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      t.map((x) => `<tr><td><b>${esc(x.nombre)}</b></td><td>${x.clasificacion === 'Ocurrencia' ? pill('Ocurrencia', 'rojo') : 'Incidencia'}</td><td>${esc(x.severidad)}</td>
+        <td>${x.sla_primer_estatus_min ? x.sla_primer_estatus_min + ' min' : '<span class="muted">general</span>'}</td>
+        <td>${x.escalamiento_inmediato ? '<b class="ko">inmediato</b>' : x.sla_escalamiento_min ? x.sla_escalamiento_min + ' min' : '<span class="muted">según zona</span>'}</td>
+        <td>${x.activo ? pill('Activo', 'verde') : pill('Inactivo', 'gris')}</td>
+        <td><button class="btn sec" onclick="formTipo('${esc(x.id)}')">Editar</button></td></tr>`).join('') + '</tbody></table>';
+  }
+  function formTipo(id) {
+    const x = id ? TIPOS_ADM.find((t) => t.id === id) : { nombre: '', clasificacion: 'Incidencia', severidad: 'media', activo: true };
+    abrirModal(id ? 'Editar tipo de incidencia' : 'Nuevo tipo de incidencia', `
+      <label>Nombre<input name="nombre" value="${esc(x.nombre)}"></label>
+      <div class="grid2">
+        <label>Clasificación<select name="clasificacion" id="t-clas">${opciones([{ v: 'Incidencia', t: 'Incidencia' }, { v: 'Ocurrencia', t: 'Ocurrencia (siniestro)' }], x.clasificacion)}</select></label>
+        <label>Severidad<select name="severidad">${opciones(['critica', 'alta', 'media', 'baja'], x.severidad)}</select></label>
+        <label>Primer estatus (min)<input name="sla_primer_estatus_min" type="number" min="1" value="${esc(x.sla_primer_estatus_min || '')}" placeholder="Vacío = valor general"></label>
+        <label>Escalamiento (min)<input name="sla_escalamiento_min" type="number" min="1" value="${esc(x.sla_escalamiento_min || '')}" placeholder="Vacío = según zona de riesgo"></label>
+      </div>
+      <label class="checks"><label><input type="checkbox" name="escalamiento_inmediato" id="t-inm" ${x.escalamiento_inmediato ? 'checked' : ''}> Escalamiento inmediato al enviar el ticket</label>
+        <label><input type="checkbox" name="activo" ${x.activo ? 'checked' : ''}> Activo (se ofrece al crear tickets)</label></label>
+      <div class="info small">Ocurrencia: el asunto lleva "OCURRENCIA" (ej. <i>A-126 - OCURRENCIA DAÑO A INFRAESTRUCTURA</i>). ${id ? '' : 'Después de crearlo, asígnalo a las listas en "Listas y cobertura".'}</div>`,
+      async (f) => { await api('api_tipoGuardar', { id: id || '', nombre: f.get('nombre'), clasificacion: f.get('clasificacion'), severidad: f.get('severidad'),
+        sla_primer_estatus_min: f.get('sla_primer_estatus_min'), sla_escalamiento_min: f.get('sla_escalamiento_min'),
+        escalamiento_inmediato: f.get('escalamiento_inmediato') === 'on', activo: f.get('activo') === 'on' });
+        toast('Tipo guardado'); CT = null; renderTipos(await api('api_tiposAdmin')); });
+    // Al elegir Ocurrencia se propone escalamiento inmediato
+    $('t-clas').onchange = () => { if ($('t-clas').value === 'Ocurrencia') $('t-inm').checked = true; };
+  }
+
+  // ---- Circuitos ----
+  let CIRC_ADM = [];
+  function renderCircuitos(c) {
+    CIRC_ADM = c;
+    $('tbl-circuitos').innerHTML = '<table><thead><tr><th>Circuito</th><th title="Unidades de Samsara de este circuito">Unidades</th><th title="Listas de distribución de correo del circuito">Listas de correo</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      c.map((x) => `<tr><td><b>${esc(x.nombre)}</b></td><td>${x.unidades}</td>
+        <td class="wrap">${x.listas ? x.listas + ' <a href="#" class="small" onclick="abrirSub(\'listas\');return false">ver</a>' : '<span class="ko">0</span> <span class="aviso-fila">sus tickets van a la lista de respaldo</span> <button class="btn sec" onclick="abrirSub(\'listas\')">Crear listas</button>'}</td>
+        <td>${x.activo ? pill('Activo', 'verde') : pill('Inactivo', 'gris')}</td><td><button class="btn sec" onclick="formCircuito('${esc(x.id)}')">Editar</button></td></tr>`).join('') + '</tbody></table>';
+  }
+  function formCircuito(id) {
+    const x = id ? CIRC_ADM.find((c) => c.id === id) : { nombre: '', activo: true };
+    abrirModal(id ? 'Editar circuito' : 'Nuevo circuito', `
+      <label>Nombre<input name="nombre" value="${esc(x.nombre)}"></label>
+      <label class="checks"><label><input type="checkbox" name="activo" ${x.activo ? 'checked' : ''}> Activo</label></label>
+      ${id ? '' : '<div class="info small">Después crea sus listas en "Listas y cobertura" y asigna sus etiquetas de Samsara.</div>'}`,
+      async (f) => { await api('api_circuitoGuardar', { id: id || '', nombre: f.get('nombre'), activo: f.get('activo') === 'on' });
+        toast('Circuito guardado'); CT = null; renderCircuitos(await api('api_circuitosAdmin')); });
+  }
+
+  // ---- Listas de distribución y matriz de cobertura ----
+  let LST = null;
+  const abreviar = (nombre) => String(nombre || '').replace('Lista ', '');
+  function renderListas() {
+    const m = LST.cobertura;
+    $('cob-resumen').textContent = '· ' + m.huecos + ' casilla(s) sin lista' + (m.dobles ? ' · ' + m.dobles + ' con 2 listas' : '');
+    $('tbl-cobertura').innerHTML = '<table class="matriz"><thead><tr><th>Tipo de incidencia</th>' + m.circuitos.map((c) => `<th>${esc(c.nombre)}</th>`).join('') + '</tr></thead><tbody>' +
+      m.tipos.map((t) => '<tr><td><b>' + esc(t.nombre) + '</b>' + (t.clasificacion === 'Ocurrencia' ? ' ' + pill('O', 'rojo') : '') + '</td>' +
+        m.circuitos.map((c) => { const ls = m.celdas[c.id][t.id];
+          const txt = ls.length ? ls.map((l) => esc(abreviar(l.nombre))).join(' + ') : '⚠';
+          return `<td class="celda ${ls.length ? (ls.length > 1 ? 'doble' : 'ok') : 'hueco'}" onclick="asignarCelda('${esc(c.id)}','${esc(t.id)}')" title="Clic para cambiar">${txt}</td>`; }).join('') + '</tr>').join('') +
+      '</tbody></table>';
+    $('tbl-listas').innerHTML = '<table><thead><tr><th>Lista</th><th>Circuito</th><th>Tipos</th><th>Correos</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      LST.listas.map((l) => `<tr><td><b>${esc(l.nombre)}</b></td><td>${l.es_respaldo ? pill('RESPALDO', 'morado') : l.es_seguridad_vial ? pill('SEGURIDAD VIAL', 'morado') : esc(l.circuito)}</td>
+        <td class="wrap small">${l.es_respaldo ? 'Recibe los tickets sin lista' : l.es_seguridad_vial ? 'Recibe los reportes de Seguridad Vial' : esc(l.tipos.join(', ') || '—')}</td><td>${l.correos.length ? l.correos.length : '<span class="ko">0</span> <span class="aviso-fila">captura los correos</span>'}</td>
+        <td>${l.activa ? pill('Activa', 'verde') : pill('Inactiva', 'gris')}</td><td><button class="btn sec" onclick="formLista('${esc(l.id)}')">Editar</button></td></tr>`).join('') + '</tbody></table>';
+  }
+  function asignarCelda(circuitoId, tipoId) {
+    const c = LST.cobertura.circuitos.find((x) => x.id === circuitoId), t = LST.cobertura.tipos.find((x) => x.id === tipoId);
+    const listas = LST.listas.filter((l) => !l.es_respaldo && l.circuito_id === circuitoId);
+    const actual = (LST.cobertura.celdas[circuitoId][tipoId][0] || {}).id || '';
+    abrirModal(t.nombre + ' · ' + c.nombre, `
+      <label>¿Qué lista recibe este tipo en este circuito?<select name="lista">${opciones([{ v: '', t: 'Ninguna (lista de respaldo)' }].concat(listas.map((l) => ({ v: l.id, t: l.nombre + ' (' + l.correos.length + ' correos)' }))), actual)}</select></label>
+      ${listas.length ? '' : '<div class="info small">Este circuito no tiene listas. Crea una con "+ Nueva lista".</div>'}
+      <div class="info small">Si el tipo estaba en otra lista de este circuito, se mueve a la elegida.</div>`,
+      async (f) => { await api('api_coberturaAsignar', circuitoId, tipoId, f.get('lista') || ''); toast('Cobertura actualizada'); CT = null; LST = await api('api_listasAdmin'); renderListas(); }, 'Asignar');
+  }
+  function formLista(id) {
+    const l = id ? LST.listas.find((x) => x.id === id) : { nombre: '', circuito_id: '', tipo_ids: [], correos: [], activa: true };
+    const esp = l.es_respaldo || l.es_seguridad_vial;
+    const tipos = LST.tipos.filter((t) => t.activo || l.tipo_ids.indexOf(t.id) !== -1);
+    const grupo = (cl) => tipos.filter((t) => t.clasificacion === cl).map((t) => `<label><input type="checkbox" name="tipo_ids" value="${esc(t.id)}" ${l.tipo_ids.indexOf(t.id) !== -1 ? 'checked' : ''}> ${esc(t.nombre)}</label>`).join('');
+    abrirModal(id ? 'Editar lista' : 'Nueva lista de distribución', `
+      <div class="grid2"><label>Nombre<input name="nombre" value="${esc(l.nombre)}" placeholder="Lista Celaya Incidencia"></label>
+      ${esp ? '<div class="info small">' + (l.es_respaldo ? 'Lista de respaldo: recibe los tickets cuyo tipo no tiene lista en su circuito.' : 'Lista de Seguridad Vial: recibe los reportes de conducta de riesgo (gerentes de operaciones, RH, protección patrimonial).') + '</div>' :
+        `<label>Circuito<select name="circuito_id">${opciones([{ v: '', t: '— Selecciona —' }].concat(ADM.circuitos.filter((c) => c.activo || c.id === l.circuito_id).map((c) => ({ v: c.id, t: c.nombre }))), l.circuito_id)}</select></label>`}</div>
+      ${esp ? '' : `<div class="subtitulo">Tipos de incidencia que recibe</div><div class="small muted">Ocurrencia</div><div class="checks">${grupo('Ocurrencia')}</div><div class="small muted">Incidencia</div><div class="checks">${grupo('Incidencia')}</div>`}
+      <label>Correos (separados por coma o punto y coma)<textarea name="correos" style="min-height:110px">${esc(l.correos.join('; '))}</textarea></label>
+      ${esp ? '' : `<label class="checks"><label><input type="checkbox" name="activa" ${l.activa ? 'checked' : ''}> Activa</label></label>`}`,
+      async (f) => { const r = await api('api_listaGuardar', { id: id || '', nombre: f.get('nombre'), circuito_id: f.get('circuito_id') || '', tipo_ids: f.getAll('tipo_ids'),
+        correos: f.get('correos'), activa: esp ? true : f.get('activa') === 'on' });
+        toast('Lista guardada' + (r.avisos && r.avisos.length ? ' · Aviso: ' + r.avisos.join('; ') : '')); CT = null; LST = await api('api_listasAdmin'); renderListas(); }, 'Guardar', false, true);
+  }
+
+  // ---- Etiquetas de Samsara ----
+  let ETQ = [];
+  const NOMBRE_USO = { circuito: 'Circuito', dolly: 'Dollys', remolque: 'Remolques', empresa: 'Empresa (agrupa)', ignorar: 'Ignorar', sin_asignar: 'Sin asignar' };
+  function renderEtiquetas() {
+    $('tbl-etiquetas').innerHTML = '<table><thead><tr><th>Etiqueta en Samsara</th><th>Uso</th><th>Circuito</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      ETQ.map((e) => `<tr><td><b>${esc(e.etiqueta)}</b>${e.en_samsara ? '' : ' <span class="small muted">(no vista en Samsara)</span>'}</td>
+        <td>${e.uso === 'sin_asignar' ? pill('Sin asignar', 'amarillo') : esc(NOMBRE_USO[e.uso] || e.uso)}</td><td>${esc(e.circuito || '—')}</td>
+        <td>${e.activo ? pill('Activa', 'verde') : pill('Inactiva', 'gris')}</td><td><button class="btn sec" onclick="formEtiqueta('${esc(e.id)}')">Editar</button></td></tr>`).join('') + '</tbody></table>';
+  }
+  function formEtiqueta(id) {
+    const e = ETQ.find((x) => x.id === id);
+    abrirModal('Etiqueta: ' + e.etiqueta, `
+      <label>¿Qué significa?<select name="uso" id="e-uso">${opciones(ADM.usos.map((u) => ({ v: u, t: NOMBRE_USO[u] || u })), e.uso)}</select></label>
+      <label id="e-circ-wrap">Circuito<select name="circuito_id">${opciones([{ v: '', t: '— Selecciona —' }].concat(ADM.circuitos.map((c) => ({ v: c.id, t: c.nombre }))), e.circuito_id)}</select></label>
+      <label class="checks"><label><input type="checkbox" name="activo" ${e.activo ? 'checked' : ''}> Activa</label></label>
+      <div class="info small">Las subetiquetas heredan el uso de su etiqueta madre si no tienen uno propio.</div>`,
+      async (f) => { await api('api_etiquetaGuardar', { id: id, uso: f.get('uso'), circuito_id: f.get('circuito_id') || '', activo: f.get('activo') === 'on' });
+        toast('Etiqueta guardada; se aplica en la próxima sincronización'); ETQ = await api('api_etiquetasAdmin'); renderEtiquetas(); });
+    const upd = () => { $('e-circ-wrap').hidden = $('e-uso').value !== 'circuito'; };
+    $('e-uso').onchange = upd; upd();
+  }
+
+  // ---- Alertas configuradas en Samsara ----
+  let ALR = null;
+  const NOMBRE_SEV = { critica: 'Crítica', alta: 'Alta', media: 'Media', baja: 'Baja' };
+  const COLOR_SEV = { critica: 'rojo', alta: 'amarillo', media: 'gris', baja: 'gris' };
+  const DESTINOS = [['monitoreo', 'Monitoreo', 'verde'], ['seguridad_vial', 'Seguridad Vial', 'morado'], ['ambos', 'Monitoreo y Seguridad Vial', 'amarillo'], ['ninguno', 'Nadie', 'gris']];
+  const pillDestino = (d) => { const x = DESTINOS.find((y) => y[0] === d) || DESTINOS[3]; return pill(x[1], x[2]); };
+  let ALR_VISTA = 'alerta';
+  function vistaAlertas(v) { ALR_VISTA = v; renderAlertasSamsara(); }
+  function renderAlertasSamsara() {
+    const cuenta = (o) => ALR.alertas.filter((a) => a.origen === o);
+    const l = cuenta(ALR_VISTA);
+    const vig = l.filter((a) => a.vigilar && a.en_samsara && a.habilitada_samsara).length;
+    $('alr-vistas').innerHTML = [['alerta', 'Alertas configuradas'], ['seguridad', 'Eventos de cámara / IA']].map((v) =>
+      `<button class="${ALR_VISTA === v[0] ? 'active' : ''}" onclick="vistaAlertas('${v[0]}')">${v[1]} (${cuenta(v[0]).length})</button>`).join('');
+    const ya = l.filter((a) => a.en_samsara).length;
+    $('alr-info').textContent = (ALR_VISTA === 'alerta' ? ya + ' alertas en Samsara' + (ya < l.length ? ' (' + (l.length - ya) + ' ya no existen)' : '') : l.length + ' tipos de evento') + ' · ' + vig + ' le llegan a alguien' + (ALR.ultima_sync ? ' · actualizado ' + fecha(ALR.ultima_sync) : '');
+    const esSeg = ALR_VISTA === 'seguridad';
+    $('tbl-alertas').innerHTML = !l.length ? '<div class="empty">Aún no se leen de Samsara. Pulsa "Actualizar desde Samsara".</div>' :
+      '<table><thead><tr><th>' + (esSeg ? 'Evento de cámara / IA' : 'Alerta en Samsara') + '</th><th>Le llega a</th>' + (esSeg ? '' : '<th>Estación que la ve</th>') + '<th>Severidad</th><th>Tipo sugerido</th><th title="Veces que sonó en los últimos 7 días">Alarmas 7 días</th><th></th></tr></thead><tbody>' +
+      l.map((a) => `<tr><td class="wrap"><b>${esc(a.nombre)}</b>${esSeg && a.etiqueta !== a.nombre ? ' <span class="small muted">' + esc(a.etiqueta) + '</span>' : ''}${a.manual ? ' ' + pill('Por enlace', 'morado') : ''}${!a.en_samsara ? ' ' + pill('Ya no existe', 'amarillo') : !a.habilitada_samsara ? ' ' + pill('Apagada en Samsara', 'gris') : ''}</td>
+        <td>${pillDestino(a.destino)}</td>${esSeg ? '' : '<td class="wrap small">' + estacionesAlerta(a) + '</td>'}
+        <td>${pill(NOMBRE_SEV[a.severidad] || a.severidad, COLOR_SEV[a.severidad] || 'gris')}</td>
+        <td>${a.tipo ? esc(a.tipo) : '<span class="muted">—</span>'}</td><td>${a.alarmas_7d}</td>
+        <td><button class="btn sec" onclick="formAlertaSamsara('${esc(a.id)}')">Editar</button></td></tr>`).join('') + '</tbody></table>';
+    if (!esSeg) $('tbl-alertas').innerHTML += lecturaSamsara();
+  }
+  const llegaAMonitoreo = (d) => d === 'monitoreo' || d === 'ambos';
+  function estacionesAlerta(a) {
+    if (!llegaAMonitoreo(a.destino)) return '<span class="muted">—</span>';
+    return a.nombres_estaciones.length ? esc(a.nombres_estaciones.join(', ')) : '<span class="muted">Según la unidad</span>';
+  }
+  function lecturaSamsara() {
+    const l = (ALR.lectura || []).slice().sort((x, y) => String(x.nombre).localeCompare(String(y.nombre)));
+    return `<details class="ayuda" style="margin-top:12px"><summary>Lo que entregó Samsara en la última lectura (${l.length})</summary>
+      <p>Esta es la lista tal cual la devolvió Samsara. Si una alerta que creaste no aparece aquí, Samsara no la entrega por su API (por ejemplo, porque su disparador no es compatible) y el sistema no puede leerla.</p>
+      ${!l.length ? '<div class="muted">Aún no hay lectura. Pulsa "Actualizar desde Samsara".</div>' :
+        '<table><thead><tr><th>Alerta</th><th>Disparador</th><th>En Samsara</th></tr></thead><tbody>' +
+        l.map((x) => `<tr><td class="wrap">${esc(x.nombre)}</td><td class="wrap small">${esc(x.disparador || '—')}</td><td>${x.habilitada ? 'Encendida' : pill('Apagada', 'gris')}</td></tr>`).join('') +
+        '</tbody></table>'}</details>`;
+  }
+  function formAlertaSamsara(id) {
+    const a = ALR.alertas.find((x) => x.id === id);
+    const tipos = [{ v: '', t: '— Sin sugerencia —' }].concat(ALR.tipos.filter((t) => t.activo || t.id === a.tipo_id).map((t) => ({ v: t.id, t: t.nombre })));
+    const esSeg = a.origen === 'seguridad';
+    abrirModal((esSeg ? 'Evento de cámara: ' : 'Alerta: ') + a.nombre, `
+      ${esSeg ? `<label>Nombre en la consola<input name="nombre" value="${esc(a.nombre)}"></label><div class="muted small">Etiqueta en Samsara: <b>${esc(a.etiqueta)}</b></div>` : ''}
+      ${a.manual ? `<label>Nombre<input name="nombre" value="${esc(a.nombre)}"></label><div class="muted small">Agregada por enlace (id ${esc(a.configuracion_id)}). Para dejar de recibirla, cámbiala a "Nadie".</div>` : ''}
+      <label>¿A quién le llega ${esSeg ? 'este evento' : 'esta alerta'}?<select name="destino">${opciones(DESTINOS.map((x) => ({ v: x[0], t: x[1] })), a.destino)}</select></label>
+      <div class="muted small">Monitoreo = consola de los monitoristas (por estación). Seguridad Vial = consola de los analistas (toda la flota). Con "ambos" llega a las dos áreas como alarmas separadas.</div>
+      ${esSeg ? '' : `<label>Estaciones que la ven (si llega a Monitoreo)
+        <span class="checks">${ALR.estaciones.map((e) => `<label><input type="checkbox" name="estaciones" value="${esc(e.id)}" ${a.estaciones.indexOf(e.id) !== -1 ? 'checked' : ''}> ${esc(e.nombre)}</label>`).join('')}</span></label>
+      <div class="muted small">Sin marcar = <b>según la unidad</b>: le llega a la estación de la etiqueta de la unidad, como siempre. Si marcas estaciones, solo esas la ven, sin importar de qué estación sea la unidad. Con varias, la ven todas y se queda con quien la tome.</div>`}
+      <label>Severidad (orden en la consola)<select name="severidad">${opciones(['critica', 'alta', 'media', 'baja'].map((x) => ({ v: x, t: NOMBRE_SEV[x] })), a.severidad)}</select></label>
+      <label>Tipo de incidencia sugerido en el ticket<select name="tipo_id">${opciones(tipos, a.tipo_id)}</select></label>
+      <div class="info small">Se aplica a las alarmas que lleguen desde ahora. En Samsara no se cambia nada.</div>`,
+      async (f) => { const d = { id: id, destino: f.get('destino'), severidad: f.get('severidad'), tipo_id: f.get('tipo_id') || '' };
+        if (esSeg) d.nombre = f.get('nombre'); else d.estaciones = f.getAll('estaciones');
+        if (a.manual) d.nombre = f.get('nombre');
+        await api('api_alertaSamsaraGuardar', d);
+        toast('Alerta guardada'); ALR = await api('api_alertasSamsaraAdmin'); renderAlertasSamsara(); });
+  }
+  function formAgregarAlertaSamsara() {
+    abrirModal('Agregar alerta por enlace', `
+      <div class="info small">Samsara no lista por su API las alertas que usan algún disparador no compatible (por ejemplo, las paradas con "la unidad se detiene"), pero sí entrega sus incidentes. Agrégala aquí una sola vez.</div>
+      <label>Enlace de la alerta en Samsara<input name="enlace" required placeholder="Abre la alerta o uno de sus incidentes en Samsara y copia la dirección"></label>
+      <label>Nombre (como aparece en Samsara)<input name="nombre" required placeholder="Parada No Autorizada Mexico"></label>
+      <div class="muted small">Después edítala para elegir a quién le llega, las estaciones que la ven, la severidad y el tipo sugerido.</div>`,
+      async (f) => {
+        const r = await api('api_alertaSamsaraAgregar', { enlace: f.get('enlace'), nombre: f.get('nombre') });
+        toast(r.alerta.nombre + ' agregada · ' + r.incidentes_7d + (r.incidentes_7d === 1 ? ' incidente' : ' incidentes') + ' en 7 días' + (r.incidentes_7d ? '' : ' (revisa que el enlace sea el correcto)'));
+        ALR = await api('api_alertasSamsaraAdmin'); renderAlertasSamsara();
+        formAlertaSamsara(r.alerta.id);
+        return 'mantener';
+      }, 'Agregar');
+  }
+  function formDiagnosticoSamsara() {
+    abrirModal('Diagnóstico de alertas de Samsara', `
+      <div class="info small">Consulta la API de Samsara de varias formas para ver qué entrega. Solo lee; no cambia nada.</div>
+      <label>Buscar en el nombre<input name="texto" value="PARADA"></label>
+      <label>Id de una alerta (opcional)<input name="id" placeholder="Número que aparece en la dirección al abrir la alerta en Samsara"></label>
+      <div id="diag-res"></div>`,
+      async (f) => {
+        $('diag-res').innerHTML = '<div class="muted">Consultando Samsara…</div>';
+        const r = await api('api_alertasSamsaraDiagnostico', f.get('texto') || '', f.get('id') || '');
+        const txt = textoDiagnostico(r);
+        $('diag-res').innerHTML = `<label>Resultado (cópialo y compártelo)<textarea readonly style="min-height:260px;font-family:Consolas,monospace;font-size:12px">${esc(txt)}</textarea></label>`;
+        return 'mantener';
+      }, 'Consultar', false, true);
+  }
+  function textoDiagnostico(r) {
+    const L = [];
+    r.consultas.forEach((q) => {
+      L.push('status=' + q.status + ': ' + (q.error ? 'ERROR ' + q.error : q.total + ' alertas en ' + q.paginas + ' página(s), coinciden ' + q.coinciden.length));
+      q.coinciden.forEach((c) => L.push('   - ' + c.nombre + ' | id ' + c.id + ' | ' + (c.habilitada === false ? 'apagada' : 'encendida') + ' | disparadores ' + c.disparadores.join(',')));
+    });
+    L.push('Distintas en total: ' + r.distintas);
+    if (r.por_id) L.push('Por id: ' + (r.por_id.error ? 'ERROR ' + r.por_id.error : r.por_id.encontradas.length + ' encontrada(s) ' + r.por_id.crudo));
+    if (r.incidentes) L.push('Incidentes 7 días: ' + (r.incidentes.error ? 'ERROR ' + r.incidentes.error : r.incidentes.total + ' ' + r.incidentes.ejemplo));
+    if (r.ejemplo) L.push('Ejemplo crudo: ' + r.ejemplo);
+    return L.join(String.fromCharCode(10));
+  }
+  async function actualizarAlertasSamsara(btn) {
+    btn.disabled = true;
+    try {
+      const r = await api('api_alertasSamsaraSincronizar');
+      toast('Samsara entregó ' + r.total + ' alertas · ' + (r.nuevas ? 'Nuevas: ' + r.nombres_nuevas.join(', ') : 'ninguna nueva') +
+        (r.retiradas ? ' · Ya no existen: ' + r.nombres_retiradas.join(', ') : '') + (r.etiquetas_nuevas ? ' · ' + r.etiquetas_nuevas + ' eventos de cámara agregados' : ''));
+      ALR = await api('api_alertasSamsaraAdmin'); renderAlertasSamsara();
+    } catch (e) { toast(errMsg(e)); }
+    btn.disabled = false;
+  }
+
+  // ---- Áreas ----
+  function renderAreas() {
+    $('tbl-areas').innerHTML = !AREAS.length ? '<div class="empty">Sin áreas. Crea la primera con "+ Nueva área".</div>' :
+      '<table><thead><tr><th>Área</th><th>Correos</th><th>Recibe tickets de</th><th>Estado</th><th></th></tr></thead><tbody>' +
+      AREAS.map((a, i) => `<tr><td><b>${esc(a.nombre)}</b>${a.escalamiento ? '<br><span class="small muted">Recibe escalamientos</span>' : ''}</td>
+        <td class="wrap">${esc(a.emails || '—')}</td>
+        <td class="wrap small">${a.categorias.length ? esc(a.categorias.join(', ')) : '<span class="muted">Ninguna categoría</span>'}</td>
+        <td>${a.activa ? pill('Activa', 'verde') : pill('Baja', 'gris')}</td>
+        <td><button class="btn sec" onclick="formArea(${i})">Editar</button></td></tr>`).join('') + '</tbody></table>';
+  }
+  function formArea(i) {
+    const a = i === undefined ? { activa: true, emails: '' } : AREAS[i];
+    abrirModal(a.id ? 'Editar área' : 'Nueva área', `
+      <label>Nombre del área<input name="nombre" value="${esc(a.nombre || '')}" placeholder="Ej. Protección Patrimonial"></label>
+      <label>Correos que reciben los tickets (separados por coma)<textarea name="emails" placeholder="persona1@empresa.com, persona2@empresa.com">${esc(a.emails || '')}</textarea></label>
+      <label class="checks"><label><input type="checkbox" name="activa" ${a.activa ? 'checked' : ''}> Activa (desmarca para darla de baja)</label></label>
+      ${a.id && a.categorias && a.categorias.length ? '<div class="info small">Recibe tickets de: ' + esc(a.categorias.join(', ')) + '. Si cambias el nombre, se actualizan solas.</div>' : ''}`,
+      async (f) => {
+        await api('api_guardarArea', { id: a.id || '', nombre: f.get('nombre'), emails: f.get('emails'), activa: f.get('activa') === 'on' });
+        toast('Área guardada');
+        AREAS = await api('api_areas'); renderAreas();
+      });
+  }
+
+  // ---- Parámetros ----
+  function valorParam(p) {
+    return p.tipo === 'booleano' ? (p.valor ? 'Sí' : 'No') : String(p.valor);
+  }
+  function inputParam(p, i) {
+    if (p.tipo === 'booleano') return `<select id="par-${i}"><option value="true" ${p.valor ? 'selected' : ''}>Sí</option><option value="false" ${p.valor ? '' : 'selected'}>No</option></select>`;
+    if (p.tipo === 'area') return `<select id="par-${i}">${opciones(PARAMS.areas, p.valor)}</select>`;
+    if (p.tipo === 'numero') return `<input id="par-${i}" type="number" min="${p.min}" max="${p.max}" value="${esc(p.valor)}">`;
+    return `<input id="par-${i}" value="${esc(p.valor)}">`;
+  }
+  function renderParametros() {
+    const grupos = [];
+    PARAMS.params.forEach((p, i) => {
+      let g = grupos.find((x) => x.nombre === p.grupo);
+      if (!g) { g = { nombre: p.grupo, filas: [] }; grupos.push(g); }
+      g.filas.push(`<div class="param">
+        <div><b>${esc(p.etiqueta)}</b>${p.modificado ? ' ' + pill('Modificado', 'amarillo') : ''}
+          <div class="small muted">${esc(p.ayuda || '')} Valor original: ${esc(valorParam(Object.assign({}, p, { valor: p.defecto })))}.</div></div>
+        <div>${inputParam(p, i)}</div>
+        <div class="acts"><button class="btn" onclick="guardarParam(${i}, this)">Guardar</button>
+          ${p.modificado ? `<button class="btn sec" onclick="restablecerParam('${esc(p.clave)}', this)">Restablecer</button>` : ''}</div>
+      </div>`);
+    });
+    const cats = PARAMS.categorias.map((c, i) => `<div class="param">
+        <div><b>${esc(c.categoria)}</b> ${pill(c.severidad, { critica: 'rojo', alta: 'amarillo' }[c.severidad] || 'gris')}${c.modificado ? ' ' + pill('Modificado', 'amarillo') : ''}
+          <div class="small muted">Original: ${esc(c.defecto.join(', '))}</div></div>
+        <div class="checks">${PARAMS.areas.map((ar) => `<label><input type="checkbox" class="cat-${i}" value="${esc(ar)}" ${c.areas.indexOf(ar) !== -1 ? 'checked' : ''}> ${esc(ar)}</label>`).join('')}</div>
+        <div class="acts"><button class="btn" onclick="guardarCategoria(${i}, this)">Guardar</button>
+          ${c.modificado ? `<button class="btn sec" onclick="restablecerParam('${esc('CATEGORIAS|' + c.categoria)}', this)">Restablecer</button>` : ''}</div>
+      </div>`).join('');
+    $('lst-parametros').innerHTML = grupos.map((g) => `<div class="param-grupo"><h3>${esc(g.nombre)}</h3>${g.filas.join('')}</div>`).join('') +
+      `<div class="param-grupo"><h3>A qué áreas se envía cada tipo de incidencia</h3>${cats}</div>`;
+  }
+  async function guardarParam(i, btn) {
+    const p = PARAMS.params[i];
+    const v = $('par-' + i).value;
+    btn.disabled = true;
+    try {
+      await api('api_guardarParametro', p.clave, p.tipo === 'booleano' ? v === 'true' : v);
+      toast('Guardado: ' + p.etiqueta);
+      PARAMS = await api('api_parametros'); renderParametros();
+    } catch (e) { toast(errMsg(e)); btn.disabled = false; }
+  }
+  async function guardarCategoria(i, btn) {
+    const c = PARAMS.categorias[i];
+    const areas = Array.from(document.querySelectorAll('.cat-' + i)).filter((x) => x.checked).map((x) => x.value);
+    btn.disabled = true;
+    try {
+      await api('api_guardarParametro', 'CATEGORIAS|' + c.categoria, areas);
+      toast('Guardado: ' + c.categoria);
+      PARAMS = await api('api_parametros'); renderParametros();
+    } catch (e) { toast(errMsg(e)); btn.disabled = false; }
+  }
+  async function restablecerParam(clave, btn) {
+    btn.disabled = true;
+    try {
+      await api('api_restablecerParametro', clave);
+      toast('Restablecido al valor original');
+      PARAMS = await api('api_parametros'); renderParametros();
+    } catch (e) { toast(errMsg(e)); btn.disabled = false; }
+  }
+
+  // ---- Bitácora ----
+  async function buscarBitacora() {
+    const filtros = {
+      desde: new Date($('b-desde').value + 'T00:00:00').toISOString(), hasta: new Date($('b-hasta').value + 'T23:59:59').toISOString(),
+      usuario: $('b-usuario').value, accion: $('b-accion').value, texto: $('b-texto').value,
+    };
+    BITA = await api('api_bitacora', filtros);
+    const selU = $('b-usuario'), selA = $('b-accion');
+    const vu = selU.value, va = selA.value;
+    selU.innerHTML = '<option value="">Todos</option>' + opciones(BITA.usuarios.concat([{ v: 'sistema', t: 'Sistema (automático)' }]), vu);
+    selA.innerHTML = '<option value="">Todas</option>' + opciones(BITA.acciones, va);
+    $('b-total').textContent = BITA.total + ' registro(s)' + (BITA.total > BITA.filas.length ? ' · se muestran los ' + BITA.filas.length + ' más recientes' : '');
+    $('tbl-bitacora').innerHTML = !BITA.filas.length ? '<div class="empty">Sin registros con esos filtros</div>' :
+      '<table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Unidad</th><th>Folio</th><th>Detalle</th></tr></thead><tbody>' +
+      BITA.filas.map((r) => `<tr><td>${fecha(r.creado_en)}</td><td>${esc(r.usuario)}</td><td>${esc(r.accion_nombre)}</td>
+        <td>${esc(r.unidad || '')}</td><td>${esc(r.folio || '')}</td><td class="wrap">${esc(r.nota)}</td></tr>`).join('') + '</tbody></table>';
+  }
+  function exportarBitacora() {
+    if (!BITA || !BITA.filas.length) { toast('Primero busca registros.'); return; }
+    const celda = (v) => '"' + String(v === null || v === undefined ? '' : v).split('"').join('""') + '"';
+    const filas = [['Fecha', 'Usuario', 'Acción', 'Unidad', 'Folio', 'Detalle']].concat(
+      BITA.filas.map((r) => [fecha(r.creado_en), r.usuario, r.accion_nombre, r.unidad, r.folio, r.nota]));
+    const csv = '﻿' + filas.map((f) => f.map(celda).join(',')).join('\r\n');
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    const nombre = 'bitacora_' + $('b-desde').value + '_a_' + $('b-hasta').value + '.csv';
+    abrirModal('Bitácora lista', `<div class="info">${BITA.filas.length} registro(s)</div>
+      <a class="btn grande" style="text-align:center;text-decoration:none" href="${url}" download="${esc(nombre)}">⬇ Descargar CSV</a>`, async () => {}, 'Cerrar', true);
+  }
+
+  let tabActual = 'consola';
+  async function abrir(tab, sinHistorial) {
+    if (!tab) return;
+    const cambio = tab !== tabActual;
+    tabActual = tab;
+    if (cambio && !sinHistorial) ruta.guardar();
+    document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+    document.querySelectorAll('.tab').forEach((s) => s.classList.toggle('active', s.id === tab));
+    try { await cargar[tab](); } catch (e) { toast(errMsg(e)); }
+  }
+  function refrescar() { if ($('modal').hidden && !$('pantalla-app').hidden) abrir(tabActual); }
+
+  // ================= Arranque =================
+  (function init() {
+    const iso = (d) => d.toLocaleDateString('en-CA');
+    $('d-desde').value = iso(new Date(Date.now() - 6 * 864e5)); $('d-hasta').value = iso(new Date());
+    $('r-desde').value = iso(new Date(Date.now() - 6 * 864e5)); $('r-hasta').value = iso(new Date());
+    $('r-texto').addEventListener('keydown', (e) => { if (e.key === 'Enter') cargar.reportes(); });
+    $('b-desde').value = iso(new Date(Date.now() - 6 * 864e5)); $('b-hasta').value = iso(new Date());
+    $('b-texto').addEventListener('keydown', (e) => { if (e.key === 'Enter') buscarBitacora(); });
+    $('config-select').addEventListener('change', (e) => abrirSub(e.target.value));
+    $('cat-tipo').addEventListener('change', () => cargarCatalogo().catch((e) => toast(errMsg(e))));
+    $('cat-estatus').addEventListener('change', () => renderCatalogo());
+    $('cat-buscar').addEventListener('input', () => renderCatalogo());
+    document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => abrir(b.dataset.tab)));
+    $('filtro-estacion').addEventListener('change', (e) => { store.set('estacion', e.target.value); abrir('consola'); });
+    $('filtro-bandeja').addEventListener('change', (e) => { store.set('bandeja', e.target.value); abrir('consola'); });
+    $('d-bandeja').addEventListener('change', () => cargar.desempeno().catch((e) => toast(errMsg(e))));
+    // Al cargar, abrir la pantalla de la dirección (#config/alertas); Atrás/Adelante del navegador cambian de pantalla
+    try {
+      if (window.google && google.script && google.script.history) google.script.history.setChangeHandler((e) => {
+        if (ruta.aplicar(e.location && e.location.hash) && !$('pantalla-app').hidden) abrir(tabActual, true);
+      });
+    } catch (e) { }
+    try {
+      if (window.google && google.script && google.script.url) google.script.url.getLocation((loc) => { ruta.aplicar(loc && loc.hash); arrancar(); });
+      else arrancar();
+    } catch (e) { arrancar(); }
+    setInterval(() => { if (tabActual === 'consola' || tabActual === 'turnos') refrescar(); }, 20000);
+  })();
+</script>

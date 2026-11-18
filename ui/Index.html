@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= include('ui/Styles'); ?>
+</head>
+<body>
+  <!-- ===== LOGIN ===== -->
+  <div id="pantalla-login" class="pantalla" hidden>
+    <form class="login-box" id="form-login" autocomplete="on">
+      <h1>Monitoreo de Flota</h1>
+      <p class="muted">Central de Monitoreo · Transportes GAL</p>
+      <label>Usuario<input name="usuario" autocomplete="username" required></label>
+      <label>Contraseña<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="btn grande" type="submit">Entrar</button>
+      <p id="login-error" class="ko small"></p>
+    </form>
+  </div>
+
+  <!-- ===== CAMBIO DE CONTRASEÑA ===== -->
+  <div id="pantalla-password" class="pantalla" hidden>
+    <form class="login-box" id="form-password">
+      <h1>Cambia tu contraseña</h1>
+      <p class="muted small">Mínimo 8 caracteres, con letras y números. No la compartas con nadie.</p>
+      <label>Contraseña actual (o temporal)<input name="actual" type="password" autocomplete="current-password" required></label>
+      <label>Nueva contraseña<input name="nueva" type="password" autocomplete="new-password" required></label>
+      <label>Confirmar nueva<input name="confirmar" type="password" autocomplete="new-password" required></label>
+      <button class="btn grande" type="submit">Guardar contraseña</button>
+      <button class="btn sec" type="button" id="btn-cancelar-pass">Cancelar</button>
+      <p id="password-error" class="ko small"></p>
+    </form>
+  </div>
+
+  <!-- ===== INICIO DE TURNO ===== -->
+  <div id="pantalla-turno" class="pantalla" hidden>
+    <form class="login-box" id="form-turno">
+      <h1>Iniciar turno</h1>
+      <p id="turno-info" class="info"></p>
+      <label>Estación que vas a cubrir<select name="estacion" required></select></label>
+      <button class="btn grande" type="submit">Iniciar turno</button>
+      <button class="btn sec" type="button" onclick="salir()">Salir</button>
+      <p id="turno-error" class="ko small"></p>
+    </form>
+  </div>
+
+  <!-- ===== APLICACIÓN ===== -->
+  <div id="pantalla-app" hidden>
+    <header>
+      <h1>Monitoreo de Flota</h1>
+      <div class="hdr-right">
+        <span id="sync" class="muted"></span>
+        <span id="hdr-turno" class="muted"></span>
+        <span id="usuario" class="muted"></span>
+        <button class="btn hdr" id="btn-entregar" hidden onclick="entregarTurno()">Entregar turno</button>
+        <button class="btn hdr sec" onclick="mostrarPassword(true)">Contraseña</button>
+        <button class="btn hdr sec" onclick="salir()">Salir</button>
+      </div>
+    </header>
+
+    <nav id="tabs">
+      <button data-tab="consola">Consola de alarmas</button>
+      <button data-tab="reportes">Reportes</button>
+      <button data-tab="desempeno">Desempeño</button>
+      <button data-tab="turnos">Turnos</button>
+      <button data-tab="eta">Citas / ETA</button>
+      <button data-tab="inactivas">Unidades detenidas</button>
+      <button data-tab="capacitacion">Capacitación</button>
+      <button data-tab="config" class="nav-config">⚙ Configuración</button>
+    </nav>
+
+    <main>
+      <!-- CONSOLA -->
+      <section id="consola" class="tab">
+        <div class="toolbar">
+          <label id="filtro-bandeja-wrap" hidden>Área
+            <select id="filtro-bandeja"></select>
+          </label>
+          <label id="filtro-estacion-wrap" hidden>Estación
+            <select id="filtro-estacion"></select>
+          </label>
+          <span id="contadores" class="muted"></span>
+          <span class="spacer"></span>
+          <button class="btn" onclick="abrirManual()">+ Registrar alarma manual</button>
+        </div>
+        <div class="cols">
+          <div class="col">
+            <h2>Nuevas <span id="n-nuevas" class="badge"></span></h2>
+            <div id="lst-nuevas" class="cards"></div>
+          </div>
+          <div class="col">
+            <h2>En atención <span id="n-atencion" class="badge"></span></h2>
+            <div id="lst-atencion" class="cards"></div>
+          </div>
+        </div>
+        <h2>Tickets en seguimiento <span id="n-tickets" class="badge"></span></h2>
+        <div id="tbl-tickets" class="tbl"></div>
+      </section>
+
+      <!-- REPORTES (PDF descargable) -->
+      <section id="reportes" class="tab">
+        <div class="toolbar">
+          <label>Desde <input type="date" id="r-desde"></label>
+          <label>Hasta <input type="date" id="r-hasta"></label>
+          <label id="r-estacion-wrap" hidden>Estación <select id="r-estacion"></select></label>
+          <input id="r-texto" placeholder="Folio, unidad, conductor, cliente…">
+          <button class="btn" onclick="cargar.reportes()">Buscar</button>
+        </div>
+        <div id="tbl-reportes" class="tbl" style="margin-top:12px"></div>
+        <p class="muted small">El PDF sigue el formato de la "Plantilla de Reporte": datos de la unidad y del conductor, incidencia, captura de Samsara y evidencias fotográficas.</p>
+      </section>
+
+      <!-- DESEMPEÑO -->
+      <section id="desempeno" class="tab">
+        <div class="toolbar">
+          <label>Desde <input type="date" id="d-desde"></label>
+          <label>Hasta <input type="date" id="d-hasta"></label>
+          <label>Turno <select id="d-turno"><option value="">Todos</option><option value="matutino">Matutino 06–14</option><option value="vespertino">Vespertino 14–22</option><option value="nocturno">Nocturno 22–06</option></select></label>
+          <label id="d-bandeja-wrap" hidden>Área <select id="d-bandeja"></select></label>
+          <label id="d-estacion-wrap" hidden>Estación <select id="d-estacion"></select></label>
+          <button class="btn" onclick="cargar.desempeno()">Actualizar</button>
+        </div>
+        <div id="kpis" class="kpis"></div>
+        <div id="tbl-desempeno" class="tbl"></div>
+        <p class="muted small">Tiempos en minutos. "Tomar" = desde que llega la alarma hasta que un monitorista la toma.
+          "Ticket" = desde que llega hasta que el ticket se envía al área (meta ≤ <span id="meta-ticket"></span> min).
+          "1er estatus en SLA" = seguimiento registrado dentro de 40 min. "Retardos" = inicio de turno con más de 10 min de retraso.</p>
+      </section>
+
+      <!-- TURNOS (supervisión) -->
+      <section id="turnos" class="tab">
+        <h2 id="turno-actual-titulo"></h2>
+        <div id="tbl-turnos-activos" class="tbl"></div>
+        <h2>Entregas de turno (últimas 24 h)</h2>
+        <div id="tbl-entregas" class="tbl"></div>
+      </section>
+
+      <!-- USUARIOS (supervisión / admin) -->
+      <!-- CONFIGURACIÓN: menú lateral por grupos (se arma en App.html según el rol) -->
+      <section id="config" class="tab">
+        <div class="config">
+          <aside class="config-menu" id="config-menu"></aside>
+          <div class="config-cont">
+            <label class="config-select">Sección <select id="config-select"></select></label>
+
+        <div id="sub-inicio" class="sub">
+          <h2 style="margin-top:0">Configuración general</h2>
+          <p class="muted small" style="margin-top:0">Lo que requiere atención en cada grupo. Haz clic en una tarjeta para ir a esa sección.</p>
+          <div id="config-tarjetas" class="config-tarjetas"></div>
+        </div>
+
+        <div id="sub-usuarios" class="sub" hidden>
+          <div class="toolbar">
+            <input id="u-buscar" placeholder="Buscar usuario o nombre…">
+            <span class="spacer"></span>
+            <button class="btn" onclick="formUsuario()">+ Nuevo usuario</button>
+          </div>
+          <div id="tbl-usuarios" class="tbl" style="margin-top:8px"></div>
+        </div>
+
+        <div id="sub-estaciones" class="sub" hidden>
+          <details class="ayuda" data-ayuda="estaciones" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> las estaciones de monitoreo. Vienen de las etiquetas dentro de <b>Monitoreo</b> en Samsara y se sincronizan solas cada hora; cada unidad pertenece a la estación de su etiqueta.</p>
+            <p><b>Grupo de apoyo:</b> las estaciones con el mismo grupo se ayudan: ven las alarmas nuevas de las otras y las pueden tomar, ven qué atienden sus compañeros y sus tickets. Usa el botón <i>Grupo</i> (solo Admin).</p>
+          </details>
+          <div class="toolbar">
+            <span id="sync-estaciones" class="muted small"></span>
+            <span class="spacer"></span>
+            <button class="btn sec" id="btn-nueva-estacion" hidden onclick="formEstacion()">+ Estación</button>
+            <button class="btn" id="btn-sync-estaciones" onclick="sincronizarEstaciones(this)">Sincronizar desde Samsara</button>
+          </div>
+          <div id="tbl-estaciones" class="tbl" style="margin-top:8px"></div>
+        </div>
+
+        <div id="sub-samsara" class="sub" hidden>
+          <details class="ayuda" data-ayuda="samsara" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> el estado de la conexión con Samsara (solo lectura). Las alarmas se leen cada minuto; estaciones, unidades, catálogos y la lista de alertas, cada hora. Si algo falla, aquí aparece el error.</p>
+          </details>
+          <div class="toolbar"><span class="spacer"></span>
+            <button class="btn" onclick="sincronizarEstaciones(this)">Sincronizar ahora</button></div>
+          <div id="tbl-samsara" class="tbl" style="margin-top:8px"></div>
+        </div>
+
+        <div id="sub-catalogos" class="sub">
+          <details class="ayuda" data-ayuda="catalogos" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> las listas de nombres que el monitorista elige al llenar un ticket (cliente u operación, supervisor, conductor, remolques, dolly y ruta). Mientras más completos estén, más rápido se llena el ticket.</p>
+            <p><b>De dónde vienen:</b> <b>conductores, remolques y dollys</b> se actualizan solos desde Samsara cada hora. <b>Clientes, supervisores y rutas</b> se administran aquí.</p>
+            <div class="ayuda-grid">
+              <div><b>Estatus</b>
+                <ul>
+                  <li><span class="pill verde">Activo</span> se ofrece en el ticket.</li>
+                  <li><span class="pill amarillo">Por validar</span> lo escribió un monitorista en un ticket y no existía. <b>Revísalo.</b></li>
+                  <li><span class="pill gris">Inactivo</span> ya no se ofrece, pero se conserva en los tickets anteriores (nada se borra).</li>
+                </ul>
+              </div>
+              <div><b>Tareas comunes</b>
+                <ul>
+                  <li><b>Revisar lo "Por validar":</b> filtra Estatus → Por validar. Si está bien escrito: <i>Editar → Activo</i>. Si ya existía escrito de otra forma: <i>Unir con…</i> el correcto (los tickets se corrigen solos).</li>
+                  <li><b>Alta:</b> elige el catálogo arriba → <i>+ Nuevo</i>.</li>
+                  <li><b>Supervisor que cambió de circuito:</b> <i>Editar</i> → cambia su circuito.</li>
+                  <li><b>Baja:</b> <i>Editar → Inactivo</i>.</li>
+                </ul>
+              </div>
+            </div>
+          </details>
+          <div class="toolbar">
+            <label>Catálogo <select id="cat-tipo"></select></label>
+            <label>Estatus <select id="cat-estatus"><option value="">Todos</option><option>Por validar</option><option>Activo</option><option>Inactivo</option></select></label>
+            <input id="cat-buscar" placeholder="Buscar…">
+            <span class="spacer"></span>
+            <button class="btn" onclick="formCatalogo()">+ Nuevo</button>
+          </div>
+          <div id="cat-info" class="muted small" style="margin:8px 0"></div>
+          <div id="tbl-catalogo" class="tbl"></div>
+        </div>
+
+        <div id="sub-tipos" class="sub" hidden>
+          <details class="ayuda" data-ayuda="tipos" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> el catálogo de incidencias que el monitorista elige en el ticket (Colisión, Tránsito lento, Robo…). El tipo decide el asunto del correo, la prioridad, los tiempos de atención y, junto con el circuito, <b>a quién se envía</b>.</p>
+            <div class="ayuda-grid">
+              <div><b>Qué significa cada columna</b>
+                <ul>
+                  <li><b>Clasificación:</b> <span class="pill rojo">Ocurrencia</span> = siniestro. El asunto lleva "OCURRENCIA" (<i>A-126 - OCURRENCIA DAÑO A INFRAESTRUCTURA</i>) y normalmente se escala de inmediato. <b>Incidencia</b> = todo lo demás.</li>
+                  <li><b>Severidad:</b> el orden de prioridad en la consola (crítica primero).</li>
+                  <li><b>1er estatus:</b> minutos que tiene el área para dar el primer seguimiento. "general" = el valor de Parámetros.</li>
+                  <li><b>Escalamiento:</b> minutos antes de escalar si nadie atiende. "inmediato" = se escala al enviar; "según zona" = 1 h en alto riesgo, 2 h en zona segura.</li>
+                </ul>
+              </div>
+              <div><b>Tareas comunes</b>
+                <ul>
+                  <li><b>Tipo nuevo:</b> <i>+ Nuevo tipo</i>. <b>Importante:</b> después ve a <i>Listas y cobertura</i> y asígnalo a una lista en cada circuito; mientras no lo hagas, sus tickets van a la lista de respaldo.</li>
+                  <li><b>Dejar de usar un tipo:</b> <i>Editar</i> → desmarca <i>Activo</i> (los tickets anteriores lo conservan).</li>
+                  <li><b>Cambiar tiempos de un tipo:</b> <i>Editar</i> → minutos de 1er estatus o escalamiento (vacío = valor general).</li>
+                </ul>
+              </div>
+            </div>
+          </details>
+          <div class="toolbar">
+            <span class="spacer"></span><button class="btn" onclick="formTipo()">+ Nuevo tipo</button>
+          </div>
+          <div id="tbl-tipos" class="tbl" style="margin-top:10px"></div>
+        </div>
+
+        <div id="sub-circuitos" class="sub" hidden>
+          <details class="ayuda" data-ayuda="circuitos" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> la operación a la que pertenece cada unidad (Celaya, Península, Cerdo Vivo…). <b>El circuito decide a quién se envían los tickets:</b> cada circuito tiene sus propias listas de correo, con el personal de esa operación.</p>
+            <p><b>De dónde sale el circuito de cada unidad:</b> de las etiquetas de Samsara dentro de <b>GRUPO GAL</b>. La equivalencia etiqueta → circuito se configura en <i>Etiquetas Samsara</i>. Si una unidad no tiene etiqueta (p. ej. un GPS portátil), el monitorista elige el circuito al hacer el ticket.</p>
+            <div class="ayuda-grid">
+              <div><b>Qué significa cada columna</b>
+                <ul>
+                  <li><b>Unidades:</b> cuántas unidades de Samsara pertenecen al circuito (las unidades prestadas cuentan en sus dos circuitos).</li>
+                  <li><b>Listas de correo:</b> cuántas listas de distribución tiene el circuito (p. ej. Ocurrencia, Incidencia, Infracción y Fallas mecánicas). <b class="ko">0</b> = no tiene ninguna: todos sus tickets se envían a la lista de respaldo.</li>
+                </ul>
+              </div>
+              <div><b>Agregar un circuito nuevo (3 pasos)</b>
+                <ol>
+                  <li><i>+ Nuevo circuito</i> y escribe su nombre.</li>
+                  <li><i>Listas y cobertura</i> → <i>+ Nueva lista</i>: crea sus listas de correo y marca qué tipos recibe cada una.</li>
+                  <li><i>Etiquetas Samsara</i> → asigna la etiqueta de Samsara de esa operación a este circuito.</li>
+                </ol>
+              </div>
+            </div>
+          </details>
+          <div class="toolbar"><span class="spacer"></span><button class="btn" onclick="formCircuito()">+ Nuevo circuito</button></div>
+          <div id="tbl-circuitos" class="tbl" style="margin-top:10px"></div>
+        </div>
+
+        <div id="sub-listas" class="sub" hidden>
+          <details class="ayuda" data-ayuda="listas" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> aquí se decide <b>quién recibe el correo de cada ticket</b>. Una <b>lista de distribución</b> es un grupo de correos de un circuito (p. ej. <i>Lista Celaya Ocurrencia</i>) que recibe ciertos tipos de incidencia.</p>
+            <p><b>Regla:</b> circuito de la unidad + tipo de incidencia → la lista de ese circuito que tiene ese tipo. Si ninguna lo tiene, el ticket va a la <b>lista de respaldo</b> (para que nunca se pierda).</p>
+            <div class="ayuda-grid">
+              <div><b>Cómo leer la matriz</b> (filas = tipos, columnas = circuitos)
+                <ul>
+                  <li><span class="muestra ok">Lista</span> el tipo tiene lista en ese circuito.</li>
+                  <li><span class="muestra hueco">⚠</span> no tiene lista: esos tickets van a la lista de respaldo. <b>Corrígelo.</b></li>
+                  <li><span class="muestra doble">A + B</span> está en dos listas: se envía a ambas (normalmente es un error).</li>
+                </ul>
+              </div>
+              <div><b>Tareas comunes</b>
+                <ul>
+                  <li><b>Corregir un ⚠ o mover un tipo:</b> da clic en la casilla y elige la lista.</li>
+                  <li><b>Agregar o quitar correos:</b> en la tabla de abajo, <i>Editar</i> la lista.</li>
+                  <li><b>Lista nueva:</b> <i>+ Nueva lista</i> → circuito, tipos que recibe y correos.</li>
+                  <li><b>Lista de respaldo:</b> recibe todo lo que no tiene lista. Mantén ahí a la jefatura de monitoreo.</li>
+                </ul>
+              </div>
+            </div>
+          </details>
+          <h2>Matriz de cobertura <span id="cob-resumen" class="muted small"></span></h2>
+          <div id="tbl-cobertura" class="tbl"></div>
+          <div class="toolbar" style="margin-top:14px"><h2 style="margin:0">Listas de distribución</h2><span class="spacer"></span><button class="btn" onclick="formLista()">+ Nueva lista</button></div>
+          <div id="tbl-listas" class="tbl" style="margin-top:8px"></div>
+        </div>
+
+        <div id="sub-etiquetas" class="sub" hidden>
+          <details class="ayuda" data-ayuda="etiquetas" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> la "traducción" de las etiquetas de Samsara que están dentro de <b>GRUPO GAL</b> a este sistema. Con ella se sabe a qué circuito pertenece cada unidad y cuáles son remolques o dollys. <b>Aquí no se modifica nada en Samsara</b> (el sistema solo lee).</p>
+            <div class="ayuda-grid">
+              <div><b>Qué significa cada uso</b>
+                <ul>
+                  <li><b>Circuito:</b> las unidades con esa etiqueta pertenecen a ese circuito.</li>
+                  <li><b>Dollys / Remolques:</b> sus activos alimentan esos catálogos (no son unidades).</li>
+                  <li><b>Empresa:</b> solo agrupa (Alva Express, Gal Logística…); sus subetiquetas tienen su propio uso.</li>
+                  <li><b>Ignorar:</b> no se usa (p. ej. Mamparas).</li>
+                  <li><span class="pill amarillo">Sin asignar</span> etiqueta nueva en Samsara: <b>revísala</b>.</li>
+                </ul>
+                <p class="small">Una subetiqueta sin uso propio hereda el de su etiqueta madre.</p>
+              </div>
+              <div><b>Tareas comunes</b>
+                <ul>
+                  <li><b>Alguien creó una etiqueta en Samsara:</b> aparecerá aquí como "Sin asignar". <i>Editar</i> → elige su uso (y circuito).</li>
+                  <li><b>Una operación se movió de circuito:</b> <i>Editar</i> la etiqueta → otro circuito.</li>
+                  <li>Los cambios se aplican en la <b>próxima sincronización</b> (cada hora) o al pulsar <i>Sincronizar desde Samsara</i> en Configuración → Estaciones y grupos.</li>
+                </ul>
+              </div>
+            </div>
+          </details>
+          <div id="tbl-etiquetas" class="tbl"></div>
+        </div>
+
+        <div id="sub-alertas" class="sub" hidden>
+          <details class="ayuda" data-ayuda="alertas" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> aquí se decide <b>qué llega de Samsara a la consola</b> como alarma para el monitorista. <b>Aquí no se modifica nada en Samsara</b> (el sistema solo lee). Hay dos listas:</p>
+            <ul>
+              <li><b>Alertas configuradas:</b> las que crearon en Samsara (Botón de pánico, Parada no autorizada, Desvío de ruta…), las del buzón <i>Incidentes de alerta</i>. Aparecen solas.</li>
+              <li><b>Eventos de cámara / IA:</b> lo que detectan las cámaras (Uso de celular, Sin cinturón, Pasajero, Alto sin detenerse…). Si Samsara manda un tipo nuevo, se agrega solo con su nombre en inglés: puedes traducirlo con <i>Editar</i>. Si un evento trae varias etiquetas, le llega a cada área que tenga al menos una de ellas.</li>
+            </ul>
+            <div class="ayuda-grid">
+              <div><b>Qué significa cada columna</b>
+                <ul>
+                  <li><b>Le llega a:</b> <span class="pill verde">Monitoreo</span> consola de los monitoristas (solo unidades de sus estaciones). <span class="pill morado">Seguridad Vial</span> consola de los analistas de conducta (toda la flota). <span class="pill amarillo">Ambos</span> a las dos áreas, como alarmas separadas. <span class="pill gris">Nadie</span> se ignora (p. ej. automatizaciones de asesoramiento).</li>
+                  <li><b>Estación que la ve</b> (alertas configuradas): <i>Según la unidad</i> = la estación de la etiqueta de la unidad. Si eliges estaciones, solo esas la ven, aunque la unidad sea de otra estación. Así, "Parada No Autorizada Mexico" la ve México aunque la unidad sea de Península 1. Con varias estaciones, la ven todas y se queda con quien la tome.</li>
+                  <li><b>Severidad:</b> el orden en la consola. Las críticas van primero y se marcan en rojo.</li>
+                  <li><b>Tipo sugerido:</b> el tipo de incidencia que aparece ya elegido al llenar el ticket (el monitorista lo puede cambiar).</li>
+                  <li><b>Alarmas 7 días:</b> cuántas veces sonó en la última semana, para detectar alertas que hacen demasiado ruido.</li>
+                </ul>
+              </div>
+              <div><b>Tareas comunes</b>
+                <ul>
+                  <li><b>Crearon una alerta nueva en Samsara:</b> aparece aquí sola (cada hora) o con <i>Actualizar desde Samsara</i>. Revisa su estación, severidad y tipo sugerido.</li>
+                  <li><b>Una alerta de Samsara no aparece</b> (p. ej. las paradas que usan "la unidad se detiene"): Samsara no lista por su API las alertas con algún disparador no compatible. Agrégala con <b>+ Agregar por enlace</b>: abre en Samsara la alerta o uno de sus incidentes, copia la dirección del navegador y escribe el nombre. Se hace una sola vez por alerta. Quedan marcadas <span class="pill morado">Por enlace</span>.</li>
+                  <li><b>Nueva estación:</b> edita las alertas de su zona y márcala en <i>Estaciones que la ven</i>.</li>
+                  <li><b>Una alerta suena demasiado:</b> bájale la severidad o cámbiala a <i>Nadie</i>.</li>
+                  <li><b>Repetidas:</b> si la misma alerta se repite en la misma unidad mientras su alarma sigue abierta, no se crea otra; la tarjeta muestra <b>×N</b>.</li>
+                  <li><span class="pill amarillo">Ya no existe</span> o <span class="pill gris">Apagada en Samsara</span>: no llega nada aunque tenga destino.</li>
+                </ul>
+              </div>
+            </div>
+          </details>
+          <div class="subnav" id="alr-vistas"></div>
+          <div class="toolbar"><span id="alr-info" class="muted small"></span><span class="spacer"></span>
+            <button class="btn sec" onclick="formDiagnosticoSamsara()">Diagnóstico</button>
+            <button class="btn sec" onclick="formAgregarAlertaSamsara()">+ Agregar por enlace</button>
+            <button class="btn" onclick="actualizarAlertasSamsara(this)">Actualizar desde Samsara</button></div>
+          <div id="tbl-alertas" class="tbl" style="margin-top:8px"></div>
+        </div>
+
+        <!-- Modelo anterior (tickets antiguos): áreas y correos. Ya no se muestra en el menú. -->
+        <div id="sub-areas" class="sub" hidden><div id="tbl-areas"></div></div>
+
+
+        <div id="sub-parametros" class="sub" hidden>
+          <details class="ayuda" data-ayuda="parametros" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> los valores generales del sistema: tiempos de atención, horarios de turno, reglas de acceso, fotos permitidas y opciones de Samsara. Cada parámetro explica para qué sirve y muestra su valor original.</p>
+            <p>Los cambios <b>aplican de inmediato</b> a todo el sistema y quedan en la bitácora. <i>Restablecer</i> regresa al valor original. Los tiempos de un tipo de incidencia en particular se cambian en <i>Tipos de incidencia</i>.</p>
+          </details>
+          <div id="lst-parametros"></div>
+        </div>
+
+        <div id="sub-bitacora" class="sub" hidden>
+          <details class="ayuda" data-ayuda="bitacora" open>
+            <summary>¿Cómo funciona esta sección?</summary>
+            <p><b>Qué es:</b> el registro de todo lo que pasa en el sistema: alarmas tomadas y descartadas, tickets enviados, seguimientos, escalamientos, turnos, inicios de sesión y cambios de administración (quién, cuándo y qué). Nada se puede borrar.</p>
+            <p><b>Cómo buscar:</b> elige fechas, usuario o acción, o escribe una unidad, folio o texto. <i>Exportar CSV</i> lo abre en Excel. Lo que hace el sistema solo (p. ej. escalar por tiempo) aparece con el usuario <b>sistema</b>.</p>
+          </details>
+          <div class="toolbar">
+            <label>Desde <input type="date" id="b-desde"></label>
+            <label>Hasta <input type="date" id="b-hasta"></label>
+            <label>Usuario <select id="b-usuario"><option value="">Todos</option></select></label>
+            <label>Acción <select id="b-accion"><option value="">Todas</option></select></label>
+            <input id="b-texto" placeholder="Unidad, folio, detalle…">
+            <button class="btn" onclick="buscarBitacora()">Buscar</button>
+            <button class="btn sec" onclick="exportarBitacora()">Exportar CSV</button>
+          </div>
+          <div id="b-total" class="muted small" style="margin:8px 0"></div>
+          <div id="tbl-bitacora" class="tbl"></div>
+        </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="eta" class="tab"><h2>Unidades en tránsito</h2><div id="tbl-eta" class="tbl"></div></section>
+      <section id="inactivas" class="tab"><h2>Unidades con 48 h o más sin movimiento</h2><div id="tbl-inactivas" class="tbl"></div></section>
+      <section id="capacitacion" class="tab"><h2>Semana actual (reinicia el lunes a las 00:00)</h2><div id="tbl-capacitacion" class="tbl"></div></section>
+    </main>
+  </div>
+
+  <!-- MODAL genérico -->
+  <div id="modal" class="modal" hidden>
+    <div class="modal-box">
+      <div class="modal-hdr"><h3 id="modal-titulo"></h3><button class="x" onclick="cerrarModal()">×</button></div>
+      <form id="modal-form" onsubmit="return false"></form>
+      <div class="modal-ftr">
+        <button class="btn sec" onclick="cerrarModal()">Cancelar</button>
+        <button class="btn" id="modal-ok">Guardar</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="cargando" hidden>Cargando…</div>
+  <div id="toast" hidden></div>
+
+  <div id="fallo-arranque" hidden style="position:fixed;inset:0;background:#fff;color:#1d2330;padding:24px;font:15px Arial,sans-serif;z-index:99">
+    <h2 style="color:#b91c1c;margin-top:0">La aplicación no pudo iniciar</h2>
+    <p>Recarga la página. Si el problema continúa, envía a soporte este detalle técnico:</p>
+    <pre id="fallo-detalle" style="background:#f1f5f9;padding:12px;white-space:pre-wrap"></pre>
+  </div>
+  <script>
+    (function () {
+      var errores = [];
+      function mostrarFallo() {
+        var caja = document.getElementById('fallo-arranque');
+        if (!caja) { return; }
+        caja.hidden = false;
+        document.getElementById('fallo-detalle').textContent = errores.join('\n');
+      }
+      window.onerror = function (mensaje, origen, linea, columna) {
+        errores.push(mensaje + ' (línea ' + linea + ', columna ' + columna + ')');
+        mostrarFallo();
+      };
+      var inicio = Date.now();
+      function revisar() {
+        var ids = ['pantalla-login', 'pantalla-password', 'pantalla-turno', 'pantalla-app'];
+        for (var k = 0; k < ids.length; k++) {
+          var e = document.getElementById(ids[k]);
+          if (e && !e.hidden) { return; }
+        }
+        var cargando = document.getElementById('cargando');
+        var esperandoServidor = cargando && !cargando.hidden;
+        if (esperandoServidor && Date.now() - inicio < 60000) { setTimeout(revisar, 5000); return; }
+        errores.push(esperandoServidor ? 'El servidor no respondió en 60 segundos.' : 'Ninguna pantalla se mostró en 10 segundos.');
+        mostrarFallo();
+      }
+      setTimeout(revisar, 10000);
+    })();
+  </script>
+  <script>
+    (function () {
+      var hex = '<?!= incluirScript_('ui/App') ?>';
+      var bytes = new Uint8Array(hex.length >> 1);
+      for (var i = 0; i < bytes.length; i++) { bytes[i] = parseInt(hex.substr(i * 2, 2), 16); }
+      var s = document.createElement('script');
+      s.textContent = new TextDecoder('utf-8').decode(bytes);
+      document.body.appendChild(s);
+    })();
+  </script>
+</body>
+</html>
