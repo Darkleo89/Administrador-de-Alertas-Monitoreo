@@ -354,6 +354,13 @@ function api_subirEvidencia(token, alarmaId, tipo, nombre, mime, base64) {
   const e = EvidenciaService.subir(alarmaId, tipo, nombre, mime, base64, ctx_(token, ROLES_CONSOLA, OPC_TURNO));
   return out_({ id: e.id, tipo: e.tipo, nombre: e.nombre });
 }
+/** PDF y video: se suben por partes (iniciar -> partes). REST: POST /api/alarmas/:id/anexos y PUT /api/anexos/:id/partes/:n */
+function api_evidenciaIniciar(token, alarmaId, tipo, nombre, mime, tamano) {
+  return out_(EvidenciaService.iniciarAnexo(alarmaId, tipo, nombre, mime, tamano, ctx_(token, ROLES_CONSOLA, OPC_TURNO)));
+}
+function api_evidenciaParte(token, evidenciaId, indice, base64) {
+  return out_(EvidenciaService.subirParte(evidenciaId, indice, base64, ctx_(token, ROLES_CONSOLA, OPC_TURNO)));
+}
 function api_eliminarEvidencia(token, evidenciaId) {
   return out_(EvidenciaService.eliminar(evidenciaId, ctx_(token, ROLES_CONSOLA, OPC_TURNO)));
 }

@@ -60,7 +60,10 @@ const SCHEMA = {
             'bandeja', 'url_video',
             // Dirección según las coordenadas: fuente samsara | google | osm | sin_direccion (se rindió tras varios intentos)
             'direccion', 'direccion_fuente', 'direccion_en', 'direccion_intentos'],
-  evidencias: ['id', 'alarma_id', 'ticket_id', 'tipo', 'nombre', 'mime', 'archivo_id', 'subido_por', 'creado_en'],
+  evidencias: ['id', 'alarma_id', 'ticket_id', 'tipo', 'nombre', 'mime', 'archivo_id', 'subido_por', 'creado_en',
+               'tamano',     // bytes
+               'estado',     // subiendo | (vacío = lista). Los PDF y videos se suben por partes
+               'enlace'],    // enlace compartido (cuando no cupo en el correo)
   seguimientos: ['id', 'alarma_id', 'ticket_id', 'usuario', 'accion', 'nota', 'creado_en'],
 
   viajes: ['id', 'unidad_id', 'cliente', 'fecha_cita', 'eta_proyectado', 'estatus'],

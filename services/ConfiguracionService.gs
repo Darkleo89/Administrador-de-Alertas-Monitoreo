@@ -52,6 +52,14 @@ const ConfiguracionService = {
       alertas_ya_no_existen: alertas.filter((a) => a.en_samsara === false && AlertasSamsaraService.destinoDe(a) !== 'ninguno').length,
       etiquetas_sin_asignar: DB.table('etiquetas_samsara').where((e) => e.activo !== false && (!e.uso || e.uso === 'sin_asignar')).length,
     };
+    // Espacio: lo que ocupan las evidencias registradas y el uso de la cuenta de Google (integración Archivos)
+    let espacio = null;
+    try { espacio = Archivos.espacio(); } catch (e) { console.warn('Espacio de Drive: ' + e.message); }
+    out.sistema = {
+      evidencias_bytes: DB.table('evidencias').all().filter((e) => e.estado !== 'subiendo' && String(e.alarma_id || '').indexOf('eliminada:') !== 0)
+        .reduce((s, e) => s + (Number(e.tamano) || 0), 0),
+      espacio_usado: espacio ? espacio.usado : null, espacio_limite: espacio ? espacio.limite : null,
+    };
     return out;
   },
 };

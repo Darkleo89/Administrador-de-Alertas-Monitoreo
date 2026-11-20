@@ -205,6 +205,10 @@
   /** Reduce una imagen en el navegador (JPEG) antes de subirla: { nombre, mime, base64 }. */
   function reducirImagen(file, maxLado) {
     return new Promise((resolve, reject) => {
+      const ext = String(file.name || '').toLowerCase().split('.').pop();
+      if (ext === 'heic' || ext === 'heif' || file.type === 'image/heic' || file.type === 'image/heif') {
+        reject(new Error(file.name + ': las fotos HEIC del iPhone no se pueden abrir aquí. Envíalas como JPG (en el iPhone: Ajustes → Cámara → Formatos → Más compatible) o compártelas por WhatsApp y descárgalas.')); return;
+      }
       if (!file.type || file.type.indexOf('image/') !== 0) { reject(new Error(file.name + ' no es una imagen.')); return; }
       const fr = new FileReader();
       fr.onerror = () => reject(new Error('No se pudo leer ' + file.name));
@@ -227,17 +231,82 @@
     });
   }
 
+  // ---- Anexos: PDF y video (sin comprimir; se suben por partes con porcentaje) ----
+  const MB = 1048576;
+  const fmtMB = (b) => (Number(b || 0) / MB).toFixed(1) + ' MB';
+  const extension = (n) => { const s = String(n || '').toLowerCase(); const i = s.lastIndexOf('.'); return i === -1 ? '' : s.slice(i + 1); };
+  /** 'pdf' | 'video' | '' según el archivo. */
+  function tipoAnexo(file) {
+    const t = String(file.type || ''), e = extension(file.name);
+    if (t === 'application/pdf' || e === 'pdf') return 'pdf';
+    if (t.indexOf('video/') === 0 || ['mp4', 'mov', '3gp'].indexOf(e) !== -1) return 'video';
+    return '';
+  }
+  function mimeAnexo(file) {
+    const porExt = { pdf: 'application/pdf', mp4: 'video/mp4', mov: 'video/quicktime', '3gp': 'video/3gpp' }[extension(file.name)];
+    return file.type && file.type !== 'application/octet-stream' ? file.type : porExt || '';
+  }
+  /** Revisa en el navegador, antes de subir, tipo, cantidad y tamaño (el servidor vuelve a validar). Agrega a `lista`. */
+  function prepararAnexos(files, ya, lista) {
+    const L = C.limites || {};
+    const cuenta = { pdf: ya.filter((e) => e.tipo === 'pdf').length, video: ya.filter((e) => e.tipo === 'video').length };
+    let total = ya.reduce((s, e) => s + (Number(e.tamano) || 0), 0);
+    Array.from(files || []).forEach((f) => {
+      const t = tipoAnexo(f);
+      if (!t) throw new Error(f.name + ': solo se aceptan PDF o videos (MP4, MOV).');
+      const max = t === 'pdf' ? L.maxPdfs : L.maxVideos;
+      if (++cuenta[t] > max) throw new Error(max ? 'Máximo ' + max + (t === 'pdf' ? ' PDF' : ' videos') + ' por incidencia.' : (t === 'pdf' ? 'No se permiten PDF.' : 'No se permiten videos.'));
+      if (f.size > L.mbArchivo * MB) throw new Error(f.name + ' pesa ' + fmtMB(f.size) + '; el máximo por archivo es ' + L.mbArchivo + ' MB.');
+      total += f.size;
+      if (total > L.mbTicket * MB) throw new Error('Con ' + f.name + ' la incidencia pasaría de ' + L.mbTicket + ' MB en total.');
+      lista.push({ file: f, tipo: t });
+    });
+  }
+  function leerParte(blob) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onerror = () => reject(new Error('No se pudo leer el archivo.'));
+      fr.onload = () => resolve(String(fr.result).split(',')[1] || '');
+      fr.readAsDataURL(blob);
+    });
+  }
+  /** Sube un PDF o video por partes. Si se corta, el reintento sigue desde la parte que falló. */
+  async function subirAnexo(alarmaId, p, progreso) {
+    const f = p.file;
+    if (!p.ini) { p.ini = await api('api_evidenciaIniciar', alarmaId, p.tipo, f.name, mimeAnexo(f), f.size); p.parte = 0; }
+    const tam = p.ini.parte_bytes;
+    const n = Math.max(1, Math.ceil(f.size / tam));
+    while (p.parte < n) {
+      if (progreso) progreso.textContent = 'Subiendo ' + f.name + ' (' + fmtMB(f.size) + '): ' + Math.round((p.parte / n) * 100) + ' %';
+      const b64 = await leerParte(f.slice(p.parte * tam, Math.min(f.size, (p.parte + 1) * tam)));
+      await api('api_evidenciaParte', p.ini.id, p.parte, b64);
+      p.parte++;
+    }
+  }
+  /** Campo de PDF y videos para los formularios (vacío si los parámetros no los permiten). */
+  function campoAnexos(ya) {
+    const L = C.limites || {};
+    if (!L.maxPdfs && !L.maxVideos) return '';
+    const usado = ya.reduce((s, e) => s + (Number(e.tamano) || 0), 0);
+    const nAnexos = ya.filter((e) => e.tipo === 'pdf' || e.tipo === 'video').length;
+    return `<label>PDF y videos (máx. ${L.mbArchivo} MB c/u; ${L.mbTicket} MB por incidencia${usado ? '; ya usados ' + fmtMB(usado) : ''}${nAnexos ? '; ya subidos: ' + nAnexos : ''})
+      <input type="file" name="anexos" accept="application/pdf,video/mp4,video/quicktime,.pdf,.mp4,.mov" multiple></label>`;
+  }
+
   /** Sube una lista de { file, tipo } a la alarma; quita de la lista las que ya se subieron (reintento seguro). */
   async function subirPendientes(alarmaId, pendientes, progreso) {
     const total = pendientes.length;
+    let antes = 0, despues = 0;
     while (pendientes.length) {
       const p = pendientes[0];
+      if (p.tipo === 'pdf' || p.tipo === 'video') { await subirAnexo(alarmaId, p, progreso); pendientes.shift(); continue; }
       if (progreso) progreso.textContent = 'Subiendo evidencia ' + (total - pendientes.length + 1) + ' de ' + total + '…';
       const img = await reducirImagen(p.file, p.tipo === 'samsara' ? 1800 : 1280);
       await api('api_subirEvidencia', alarmaId, p.tipo, img.nombre, img.mime, img.base64);
+      antes += p.file.size || 0; despues += Math.round(img.base64.length * 0.75);
       pendientes.shift();
     }
-    if (progreso) progreso.textContent = total ? 'Evidencias subidas.' : '';
+    if (progreso) progreso.textContent = total ? 'Evidencias subidas.' + (antes ? ' Fotos comprimidas: ' + fmtMB(antes) + ' → ' + fmtMB(despues) + '.' : '') : '';
   }
 
   /** Pide el PDF y muestra un botón de descarga (el clic del usuario evita bloqueos del navegador). */
@@ -259,18 +328,25 @@
   /** Agregar evidencias a un ticket ya enviado. */
   function agregarEvidencia(alarmaId) {
     const pendientes = [];
+    const ya = (C && C.evidencias && C.evidencias[alarmaId]) || [];
     abrirModal('Agregar evidencia', `
-      <label>Tipo<select name="tipo"><option value="foto">Foto de evidencia</option><option value="samsara">Captura de plataforma Samsara</option></select></label>
-      <label>Imágenes (JPG/PNG)<input type="file" name="archivos" accept="image/jpeg,image/png" multiple></label>
+      <label>Tipo de imagen<select name="tipo"><option value="foto">Foto de evidencia</option><option value="samsara">Captura de plataforma Samsara</option></select></label>
+      <label>Imágenes (JPG/PNG; se comprimen solas)<input type="file" name="archivos" accept="image/jpeg,image/png" multiple></label>
       <div class="muted small">También puedes pegar una captura con Ctrl+V.</div>
+      ${campoAnexos(ya)}
+      <div class="muted small">Lo que agregues aquí queda en el sistema y en el PDF; no se vuelve a enviar el correo.</div>
       <div id="f-progreso"></div>`,
       async (f) => {
         if (!pendientes.length) {
-          Array.from($('modal-form').archivos.files).forEach((file) => pendientes.push({ file: file, tipo: f.get('tipo') }));
+          const form = $('modal-form');
+          const anexos = [];
+          prepararAnexos(form.anexos ? form.anexos.files : [], ya, anexos);
+          Array.from(form.archivos.files).forEach((file) => pendientes.push({ file: file, tipo: f.get('tipo') }));
           (window._pegadas || []).forEach((file) => pendientes.push({ file: file, tipo: f.get('tipo') }));
+          anexos.forEach((x) => pendientes.push(x));
           window._pegadas = [];
         }
-        if (!pendientes.length) throw new Error('Selecciona al menos una imagen.');
+        if (!pendientes.length) throw new Error('Selecciona al menos una imagen, PDF o video.');
         await subirPendientes(alarmaId, pendientes, $('f-progreso'));
         toast('Evidencia agregada. Descarga de nuevo el PDF para verla.');
       }, 'Subir');
@@ -434,7 +510,7 @@
     const prev = (C.previos && C.previos[a.unidad_id]) || {};
     const ya = (C.evidencias && C.evidencias[a.id]) || [];
     const yaSamsara = ya.filter((e) => e.tipo === 'samsara').length;
-    const yaFotos = ya.filter((e) => e.tipo !== 'samsara').length;
+    const yaFotos = ya.filter((e) => e.tipo === 'foto').length;
     // Campo con sugerencias del catálogo; acepta texto nuevo (queda "Por validar")
     const campo = (name, label, valor, ph, dl) => `<label>${label}<input name="${name}" value="${esc(valor || '')}" placeholder="${esc(ph || '')}" ${dl ? 'list="' + dl + '"' : ''} autocomplete="off"></label>`;
     const candidatos = a.circuitos_unidad || [];
@@ -492,6 +568,7 @@
         <label>Fotos de evidencia (hasta ${C.maxFotos - yaFotos}) ${yaFotos ? '· ya subidas: ' + yaFotos : ''}
           <input type="file" name="fotos" accept="image/jpeg,image/png" multiple></label>
       </div>
+      ${campoAnexos(ya)}
       <div id="f-progreso"></div>`;
 
     const pendientes = [];
@@ -508,8 +585,11 @@
         const samsara = Array.from(form.samsara.files || []).concat(window._pegadas || []).slice(0, Math.max(0, 1 - yaSamsara));
         const fotos = Array.from(form.fotos.files || []);
         if (fotos.length > C.maxFotos - yaFotos) throw new Error('Máximo ' + (C.maxFotos - yaFotos) + ' fotos más.');
+        const anexos = [];
+        prepararAnexos(form.anexos ? form.anexos.files : [], ya, anexos);
         samsara.forEach((file) => pendientes.push({ file: file, tipo: 'samsara' }));
         fotos.forEach((file) => pendientes.push({ file: file, tipo: 'foto' }));
+        anexos.forEach((x) => pendientes.push(x));
         preparadas = true;
       }
       await subirPendientes(id, pendientes, $('f-progreso'));
@@ -539,7 +619,7 @@
     const a = C.enAtencion.find((x) => x.id === id);
     const ya = (C.evidencias && C.evidencias[a.id]) || [];
     const yaSamsara = ya.filter((e) => e.tipo === 'samsara').length;
-    const yaFotos = ya.filter((e) => e.tipo !== 'samsara').length;
+    const yaFotos = ya.filter((e) => e.tipo === 'foto').length;
     const campo = (name, label, valor, ph) => `<label>${label}<input name="${name}" value="${esc(valor || '')}" placeholder="${esc(ph || '')}" autocomplete="off"></label>`;
     const enlace = esHttps(a.url_origen) ? a.url_origen : '';
     const html = `
@@ -564,6 +644,7 @@
         <label>Imágenes del video (hasta ${C.maxFotos - yaFotos}) ${yaFotos ? '· ya subidas: ' + yaFotos : ''}
           <input type="file" name="fotos" accept="image/jpeg,image/png" multiple></label>
       </div>
+      ${campoAnexos(ya)}
       <div id="f-progreso"></div>`;
     const pendientes = [];
     let preparadas = false;
@@ -576,8 +657,11 @@
         const samsara = Array.from(form.samsara.files || []).concat(window._pegadas || []).slice(0, Math.max(0, 1 - yaSamsara));
         const fotos = Array.from(form.fotos.files || []);
         if (fotos.length > C.maxFotos - yaFotos) throw new Error('Máximo ' + (C.maxFotos - yaFotos) + ' imágenes más.');
+        const anexos = [];
+        prepararAnexos(form.anexos ? form.anexos.files : [], ya, anexos);
         samsara.forEach((file) => pendientes.push({ file: file, tipo: 'samsara' }));
         fotos.forEach((file) => pendientes.push({ file: file, tipo: 'foto' }));
+        anexos.forEach((x) => pendientes.push(x));
         preparadas = true;
       }
       await subirPendientes(id, pendientes, $('f-progreso'));
@@ -1079,7 +1163,16 @@
       ['Alertas que ya no existen y aún tienen destino', M.alertas_ya_no_existen, n(M.alertas_ya_no_existen), 'alertas'],
       ['Etiquetas sin asignar', M.etiquetas_sin_asignar, n(M.etiquetas_sin_asignar), 'etiquetas'],
     ]]);
-    tarjetas.push(['Sistema', (esAdmin() ? [['Parámetros', 'Tiempos, turnos y accesos', '', 'parametros']] : []).concat([['Bitácora', 'Ver lo que pasó', '', 'bitacora']])]);
+    const Z = CFG.sistema;
+    const espacio = [];
+    if (Z && Z.espacio_usado !== null) {
+      const pct = Z.espacio_limite > 0 ? Math.round((Z.espacio_usado / Z.espacio_limite) * 100) : null;
+      const gb = (b) => (b / 1073741824).toFixed(1) + ' GB';
+      espacio.push(['Espacio en Drive (evidencias, correo y archivos)', gb(Z.espacio_usado) + (pct !== null ? ' de ' + gb(Z.espacio_limite) + ' (' + pct + ' %)' : ''),
+        pct === null ? '' : pct >= 95 ? 'bad' : pct >= 80 ? 'warn' : 'bien', 'parametros', 'Cuando se llene, ya no se podrán subir evidencias. En Docker se usará el espacio del servidor.']);
+    }
+    if (Z) espacio.push(['Evidencias guardadas (registradas)', fmtMB(Z.evidencias_bytes), '', 'parametros']);
+    tarjetas.push(['Sistema', espacio.concat(esAdmin() ? [['Parámetros', 'Tiempos, turnos, accesos y evidencias', '', 'parametros']] : []).concat([['Bitácora', 'Ver lo que pasó', '', 'bitacora']])]);
     $('config-tarjetas').innerHTML = tarjetas.map((t) => {
       const clase = t[1].some((l) => l[2] === 'bad') ? 'error' : t[1].some((l) => l[2] === 'warn') ? 'atencion' : '';
       return `<div class="tarjeta ${clase}"><h3>${esc(t[0])}</h3><ul>` + t[1].map((l) =>

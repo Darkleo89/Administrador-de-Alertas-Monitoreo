@@ -57,14 +57,15 @@ const AlarmaService = {
     if (enAtencion.length) {
       const ids = {};
       enAtencion.forEach((a) => { ids[a.id] = true; });
-      DB.table('evidencias').where((e) => ids[e.alarma_id]).forEach((e) => {
-        (evidencias[e.alarma_id] = evidencias[e.alarma_id] || []).push({ id: e.id, tipo: e.tipo, nombre: e.nombre });
+      DB.table('evidencias').where((e) => ids[e.alarma_id] && e.estado !== 'subiendo').forEach((e) => {
+        (evidencias[e.alarma_id] = evidencias[e.alarma_id] || []).push({ id: e.id, tipo: e.tipo, nombre: e.nombre, tamano: Number(e.tamano) || 0 });
       });
     }
 
     return {
       nuevas: nuevas, enAtencion: enAtencion, companeros: companeros, mi_estacion: usuario.estacion_id || '', tickets: tickets, previos: previos, evidencias: evidencias,
       maxFotos: CONFIG.EVIDENCIAS.MAX_FOTOS,
+      limites: { maxPdfs: CONFIG.EVIDENCIAS.MAX_PDFS, maxVideos: CONFIG.EVIDENCIAS.MAX_VIDEOS, mbArchivo: CONFIG.EVIDENCIAS.MAX_MB_ARCHIVO, mbTicket: CONFIG.EVIDENCIAS.MAX_MB_TICKET },
       estaciones: DB.table('estaciones').where((e) => e.activa !== false),
       categorias: Object.keys(CONFIG.CATEGORIAS).map((c) => ({ nombre: c, areas: CONFIG.CATEGORIAS[c].areas })),
       areas: DB.table('areas').where((a) => a.activa !== false).map((a) => a.nombre),

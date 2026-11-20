@@ -31,6 +31,18 @@ const Plantillas = {
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   },
   val: function (v) { return v === null || v === undefined || v === '' ? '—' : this.esc(v); },
+  /** Lista de anexos. En el correo dice si va adjunto o el enlace para verlo; en el PDF, solo nombre y tamaño. */
+  listaAnexos: function (anexos, correo) {
+    const tipo = { pdf: 'PDF', video: 'Video' };
+    return anexos.map((a) => {
+      const mb = (Number(a.tamano || 0) / 1048576).toFixed(1) + ' MB';
+      let como = '';
+      if (correo && a.modo === 'adjunto') como = ' — <b>adjunto en este correo</b>';
+      else if (correo && a.modo === 'enlace') como = ' — <a href="' + this.esc(a.enlace) + '">ver / descargar</a> (no cupo en el correo)';
+      else if (correo) como = ' — disponible en el sistema';
+      return '<div style="padding:3px 0">📎 ' + this.esc(a.nombre) + ' <span style="color:#666">(' + tipo[a.tipo] + ' · ' + mb + ')</span>' + como + '</div>';
+    }).join('') + (correo ? '' : '<div style="color:#666;padding-top:4px">Los anexos se envían con el correo del ticket y quedan guardados en el sistema.</div>');
+  },
   fecha: function (d) { return d ? Utilities.formatDate(new Date(d), CONFIG_TZ_(), 'dd/MM/yyyy') : '—'; },
   hora: function (d) { return d ? Utilities.formatDate(new Date(d), CONFIG_TZ_(), 'HH:mm') : '—'; },
   coords: function (t) { return t.lat && t.lng ? Number(t.lat).toFixed(6) + ', ' + Number(t.lng).toFixed(6) : ''; },
@@ -76,6 +88,7 @@ const Plantillas = {
         (t.contacto_operador ? '<br><b>Contacto con el operador:</b> ' + this.esc(t.contacto_operador) : '') + '</td></tr>' +
       this.seccion('▌ EVIDENCIA FOTOGRÁFICA') +
       '<tr><td style="padding:4px 0">' + fotos + '</td></tr>' +
+      ((d.anexos || []).length ? this.seccion('▌ ANEXOS (PDF Y VIDEO)') + '<tr><td style="padding:4px 0;font-size:13px">' + this.listaAnexos(d.anexos, true) + '</td></tr>' : '') +
       (sv ? '<tr><td style="font-size:12px;color:#555;padding:8px 0">Reporte completo en PDF adjunto.</td></tr>'
         : '<tr><td style="font-size:12px;color:#555;padding:8px 0">SLA: primer estatus antes de las <b>' + this.hora(t.sla_primer_estatus_en) +
         '</b> · escalamiento a las <b>' + this.hora(t.sla_escalamiento_en) + '</b> (' + this.esc(t.zona_riesgo) + '). Reporte completo en PDF adjunto.</td></tr>') +
@@ -148,6 +161,7 @@ const Plantillas = {
         (d.alarma && d.alarma.url_origen ? '<div style="font-size:11px;padding-top:4px">Evento en Samsara: ' + this.esc(d.alarma.url_origen) + '</div>' : '') + '</td></tr>') +
 
       caja('EVIDENCIAS FOTOGRÁFICAS', '<tr><td colspan="2" style="padding:4px">' + gridFotos() + '</td></tr>') +
+      ((d.anexos || []).length ? caja('ANEXOS (PDF Y VIDEO)', '<tr><td colspan="2" style="padding:6px 8px;font-size:12px">' + this.listaAnexos(d.anexos, false) + '</td></tr>') : '') +
 
       (seguimiento.length ? caja('SEGUIMIENTO',
         seguimiento.map((s) => '<tr><td colspan="2" style="font-size:12px;padding:5px 8px;border-bottom:1px solid #e1e6ed"><b>' + this.fecha(s.creado_en) + ' ' + this.hora(s.creado_en) +

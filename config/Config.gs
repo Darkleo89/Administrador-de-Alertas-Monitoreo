@@ -79,6 +79,15 @@ const CONFIG = {
     MAX_BYTES: 3 * 1024 * 1024,     // por imagen, ya reducida en el navegador
     TIPOS: ['image/jpeg', 'image/png'],
     CARPETA: 'Monitoreo de Flota - Evidencias',
+    // Anexos (PDF y video). Límites editables en Configuración → Sistema → Parámetros (los mismos en Docker).
+    MAX_PDFS: 3,
+    MAX_VIDEOS: 3,
+    MAX_MB_ARCHIVO: 20,              // por archivo (PDF o video)
+    MAX_MB_TICKET: 30,               // total por incidencia (fotos + PDF + video)
+    CORREO_MAX_MB: 20,               // lo que no quepa en el correo va como enlace
+    TIPOS_PDF: ['application/pdf'],
+    TIPOS_VIDEO: ['video/mp4', 'video/quicktime', 'video/3gpp'],
+    PARTE_BYTES: 4 * 1024 * 1024,    // subida por partes (múltiplo de 256 KB)
   },
   EMPRESA: 'Transportes GAL',
 

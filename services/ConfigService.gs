@@ -30,6 +30,14 @@ const ConfigService = {
 
     { clave: 'EVIDENCIAS.MAX_FOTOS', grupo: 'Evidencias', etiqueta: 'Fotos máximas por incidencia', tipo: 'numero', min: 1, max: 30,
       ayuda: 'La Plantilla de Reporte contempla 15.' },
+    { clave: 'EVIDENCIAS.MAX_MB_ARCHIVO', grupo: 'Evidencias', etiqueta: 'Tamaño máximo por archivo PDF o video (MB)', tipo: 'numero', min: 1, max: 100,
+      ayuda: 'Los videos de WhatsApp suelen pesar menos de 16 MB. Las fotos se comprimen solas antes de subirse.' },
+    { clave: 'EVIDENCIAS.MAX_MB_TICKET', grupo: 'Evidencias', etiqueta: 'Tamaño máximo total por incidencia (MB)', tipo: 'numero', min: 1, max: 200,
+      ayuda: 'Suma de fotos, PDF y videos de una misma incidencia.' },
+    { clave: 'EVIDENCIAS.MAX_PDFS', grupo: 'Evidencias', etiqueta: 'PDF máximos por incidencia', tipo: 'numero', min: 0, max: 10, ayuda: '0 = no se permiten PDF.' },
+    { clave: 'EVIDENCIAS.MAX_VIDEOS', grupo: 'Evidencias', etiqueta: 'Videos máximos por incidencia', tipo: 'numero', min: 0, max: 10, ayuda: '0 = no se permiten videos.' },
+    { clave: 'EVIDENCIAS.CORREO_MAX_MB', grupo: 'Evidencias', etiqueta: 'Tamaño máximo del correo (MB)', tipo: 'numero', min: 5, max: 24,
+      ayuda: 'PDF y videos van adjuntos mientras el correo no pase de este tamaño; los demás van como enlace. Muchos servidores de correo rechazan más de 20–25 MB.' },
 
     { clave: 'SAMSARA.TAG_PADRE_ESTACIONES', grupo: 'Samsara', etiqueta: 'Etiqueta padre de las estaciones', tipo: 'texto',
       ayuda: 'Las etiquetas hijas de esta etiqueta en Samsara son las estaciones.' },

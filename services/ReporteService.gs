@@ -12,7 +12,9 @@ const ReporteService = {
     return {
       ticket: t, alarma: alarma, estacion: estacion,
       monitorista: { login: t.monitorista, nombre: (u && u.nombre) || t.monitorista },
-      evidencias: EvidenciaService.deAlarma(t.alarma_id),
+      // Imágenes (captura y fotos) van en el cuerpo; PDF y videos son anexos (adjuntos o enlace).
+      evidencias: EvidenciaService.deAlarma(t.alarma_id).filter((e) => e.tipo === 'samsara' || e.tipo === 'foto'),
+      anexos: EvidenciaService.deAlarma(t.alarma_id).filter((e) => e.tipo === 'pdf' || e.tipo === 'video'),
       seguimientos: DB.table('seguimientos').where((s) => s.ticket_id === t.id).sort((a, b) => new Date(a.creado_en) - new Date(b.creado_en)),
     };
   },
@@ -44,17 +46,38 @@ const ReporteService = {
     return { nombre: blob.getName(), base64: Archivos.pdfBase64(blob) };
   },
 
-  /** Correo con el formato de la plantilla: { html, inlineImages, adjuntos }. */
+  /**
+   * Correo con el formato de la plantilla: { html, inlineImages, adjuntos }.
+   * PDF y videos van adjuntos (de menor a mayor) mientras el correo no pase de CONFIG.EVIDENCIAS.CORREO_MAX_MB;
+   * los que no caben se comparten y van como enlace.
+   */
   paqueteCorreo: function (ticketId) {
     const d = this.datos(ticketId);
     const inline = {};
     const validas = [];
+    let usado = 0;
     d.evidencias.forEach((e) => {
-      try { inline['ev' + validas.length] = Archivos.blob(e.archivo_id); validas.push(e); }
+      try { const b = Archivos.blob(e.archivo_id); inline['ev' + validas.length] = b; validas.push(e); usado += b.getBytes().length; }
       catch (err) { console.warn('Evidencia no disponible: ' + e.archivo_id); }
     });
     d.evidencias = validas;
-    return { html: Plantillas.correo(d), inlineImages: inline, adjuntos: [this.pdfBlob(ticketId)], datos: d };
+    const pdf = this.pdfBlob(ticketId);
+    usado += pdf.getBytes().length;
+    const limite = CONFIG.EVIDENCIAS.CORREO_MAX_MB * 1048576;
+    const adjuntos = [pdf];
+    d.anexos = d.anexos.slice().sort((a, b) => (Number(a.tamano) || 0) - (Number(b.tamano) || 0)).map((a) => {
+      const tam = Number(a.tamano) || 0;
+      if (usado + tam <= limite) {
+        try { adjuntos.push(Archivos.blob(a.archivo_id).setName(a.nombre)); usado += tam; return Object.assign({}, a, { modo: 'adjunto' }); }
+        catch (err) { console.warn('Anexo no disponible: ' + a.archivo_id); }
+      }
+      try {
+        const url = a.enlace || Archivos.compartir(a.archivo_id);
+        if (!a.enlace) DB.table('evidencias').update(a.id, { enlace: url });
+        return Object.assign({}, a, { modo: 'enlace', enlace: url });
+      } catch (err) { return Object.assign({}, a, { modo: 'no_disponible' }); }
+    });
+    return { html: Plantillas.correo(d), inlineImages: inline, adjuntos: adjuntos, datos: d };
   },
 
   /** Lista de tickets para la pestaña Reportes. */
